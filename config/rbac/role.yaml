@@ -5,19 +5,23 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - ""
+  - apps
   resources:
-  - pods
+  - deployments
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
-  - ""
+  - apps
   resources:
-  - pods/proxy
+  - deployments/scale
   verbs:
   - get
+  - patch
+  - update
 - apiGroups:
   - ifaas.ifbiu.com
   resources:
@@ -44,3 +48,15 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - serving.knative.dev
+  resources:
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch

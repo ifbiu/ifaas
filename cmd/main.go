@@ -35,6 +35,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	kservingv1 "knative.dev/serving/pkg/apis/serving/v1"
+
 	ifaasv1alpha1 "github.com/ifbiu/ifaas/api/ifaas/v1alpha1"
 	ifaascontroller "github.com/ifbiu/ifaas/internal/controller/ifaas"
 	webhookifaasv1alpha1 "github.com/ifbiu/ifaas/internal/webhook/ifaas/v1alpha1"
@@ -50,6 +52,7 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(ifaasv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(kservingv1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 

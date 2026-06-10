@@ -194,10 +194,13 @@ GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 KUSTOMIZE_VERSION ?= v5.8.1
 CONTROLLER_TOOLS_VERSION ?= v0.21.0
 
-#ENVTEST_VERSION is the controller-runtime version to use for setup-envtest, derived from go.mod
-ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; \
-  [ -n "$$v" ] || { echo "Set ENVTEST_VERSION manually (controller-runtime replace has no tag)" >&2; exit 1; }; \
-  printf '%s\n' "$$v")
+#ENVTEST_VERSION pins the setup-envtest CLI. setup-envtest is published from
+#its own go module under sigs.k8s.io/controller-runtime/tools/setup-envtest
+#and tagged independently from controller-runtime; deriving it from the
+#controller-runtime version in go.mod yields a tag that does not exist as a
+#submodule release. Use a known-good branch tag here and override via
+#environment variable when chasing a newer release.
+ENVTEST_VERSION ?= release-0.21
 
 #ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
 ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
