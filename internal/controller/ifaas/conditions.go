@@ -28,7 +28,26 @@ const (
 	ReasonSourceQuiesced         = "SourceQuiesced"
 	ReasonSourceScaleFailed      = "SourceScaleFailed"
 	ReasonReconciling            = "Reconciling"
+
+	// ServiceSwapper reasons.
+	ReasonServiceSwapping       = "ServiceSwapping"
+	ReasonServiceSwapTakenOver  = "ServiceSwapTakenOver"
+	ReasonServiceSwapTypeRefuse = "ServiceTypeNotSupported"
+	ReasonServiceSwapOwnedByOS  = "ServiceOwnedByExternal"
+	ReasonServiceSwapDeleteFail = "ServiceDeleteFailed"
 )
 
 // FieldOwner used for server-side apply of operator-owned KSvc objects.
 const FieldOwner = "ifaas-autopilot"
+
+// FinalizerRestoreSourceService keeps the KnativeAdoption alive until the
+// ServiceSwapper teardown path (S9) can rebuild the pre-adoption Service from
+// status.sourceSnapshot.service.
+const FinalizerRestoreSourceService = "ifaas.ifbiu.com/restore-source-service"
+
+// AnnoServiceManagedBy marks a Service the operator already adopted in a prior
+// reconcile loop, so the swapper does not snapshot/delete it twice.
+const (
+	AnnoServiceManagedBy      = "ifaas.ifbiu.com/managed-by"
+	AnnoServiceManagedByValue = "knative-autopilot"
+)

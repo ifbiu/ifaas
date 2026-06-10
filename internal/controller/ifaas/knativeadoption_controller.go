@@ -22,6 +22,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -50,6 +51,11 @@ const requeueAfterKSvcPending = 10 * time.Second
 // that label-driven creation (S4) or a manual fix can land without busy-looping.
 const requeueAfterSourceMissing = 30 * time.Second
 
+// requeueAfterServiceSwap gives the apiserver enough time to finalize the
+// deletion of a same-name Service before the reconciler tries to apply the
+// KSvc against the same name.
+const requeueAfterServiceSwap = 1 * time.Second
+
 // KnativeAdoptionReconciler reconciles a KnativeAdoption object.
 type KnativeAdoptionReconciler struct {
 	client.Client
@@ -67,6 +73,7 @@ type KnativeAdoptionReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;patch;update
 // +kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=get;patch;update
 // +kubebuilder:rbac:groups=serving.knative.dev,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;delete;create
 
 // Reconcile implements the adoption pipeline described in
 // docs/knative-autopilot-impl-plan.md §S3.
@@ -83,6 +90,24 @@ func (r *KnativeAdoptionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	// Snapshot so we can write status with a single patch at the end.
 	original := adoption.DeepCopy()
+
+	// S5: ensure the restore-source-service finalizer is present before we
+	// touch any external state. Status patches happen at the end of Reconcile,
+	// but this is a spec-level mutation so we apply it now via its own patch.
+	if adoption.DeletionTimestamp.IsZero() {
+		if err := r.ensureRestoreFinalizer(ctx, &adoption); err != nil {
+			return ctrl.Result{}, err
+		}
+		// Re-snapshot after the finalizer patch so the end-of-Reconcile status
+		// diff is computed against the latest spec.
+		original = adoption.DeepCopy()
+	} else {
+		// Deletion path is owned by S9. For now we let the controller idle
+		// while the CR awaits its restore-source-service finalizer; the
+		// teardown logic will be wired up there.
+		log.V(1).Info("adoption marked for deletion; skipping reconcile until S9 lands")
+		return ctrl.Result{}, nil
+	}
 
 	res, reconcileErr := r.reconcileAdoption(ctx, &adoption)
 
@@ -125,6 +150,28 @@ func (r *KnativeAdoptionReconciler) reconcileAdoption(ctx context.Context, adopt
 		return ctrl.Result{}, nil
 	}
 	apimeta.RemoveStatusCondition(&adoption.Status.Conditions, ifaasv1alpha1.ConditionTranslationDegraded)
+
+	// Step 2.5 (S5): handle the same-name Service before we apply the KSvc.
+	// SwapRefused short-circuits the pipeline; the operator must not race with
+	// a Service the user explicitly wants to keep.
+	swap, err := r.swapService(ctx, adoption)
+	if err != nil {
+		setReady(adoption, metav1.ConditionFalse, ReasonServiceSwapDeleteFail, err.Error())
+		return ctrl.Result{}, err
+	}
+	if swap == SwapRefused {
+		setCondition(adoption, ifaasv1alpha1.ConditionAdopted, metav1.ConditionFalse,
+			ReasonServiceSwapTypeRefuse, "service adoption refused; KSvc not created")
+		setReady(adoption, metav1.ConditionFalse, ReasonServiceSwapTypeRefuse,
+			"service adoption refused")
+		return ctrl.Result{}, nil
+	}
+	if swap == SwapTakenOver {
+		// The Service has just been deleted; let the apiserver finish the
+		// removal before we try to apply the KSvc against the same name.
+		// A short requeue is enough — the cache will catch up almost immediately.
+		return ctrl.Result{RequeueAfter: requeueAfterServiceSwap}, nil
+	}
 
 	// Step 3: own + server-side apply KSvc.
 	if err := controllerutil.SetControllerReference(adoption, ksvc, r.Scheme); err != nil {
@@ -223,6 +270,9 @@ func statusEqual(a, b *ifaasv1alpha1.KnativeAdoption) bool {
 		if (ar == nil) != (br == nil) || (ar != nil && *ar != *br) {
 			return false
 		}
+		if (a.Status.SourceSnapshot.Service == nil) != (b.Status.SourceSnapshot.Service == nil) {
+			return false
+		}
 	}
 	if len(a.Status.Conditions) != len(b.Status.Conditions) {
 		return false
@@ -244,6 +294,10 @@ func setCondition(a *ifaasv1alpha1.KnativeAdoption, t string, s metav1.Condition
 		Message:            msg,
 		ObservedGeneration: a.Generation,
 	})
+}
+
+func removeCondition(a *ifaasv1alpha1.KnativeAdoption, t string) {
+	apimeta.RemoveStatusCondition(&a.Status.Conditions, t)
 }
 
 func setReady(a *ifaasv1alpha1.KnativeAdoption, s metav1.ConditionStatus, reason, msg string) {
@@ -269,6 +323,7 @@ func (r *KnativeAdoptionReconciler) serviceReady() func(*kservingv1.Service) (bo
 //   - KnativeAdoption (primary)
 //   - owned KSvc → owner reference fan-out
 //   - Deployment with matching name in same namespace → mapDeploymentToAdoptions
+//   - Service with matching name in same namespace → mapServiceToAdoptions (S5)
 func (r *KnativeAdoptionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ifaasv1alpha1.KnativeAdoption{}).
@@ -276,6 +331,11 @@ func (r *KnativeAdoptionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&appsv1.Deployment{},
 			handler.EnqueueRequestsFromMapFunc(r.mapDeploymentToAdoptions),
+			builder.WithPredicates(),
+		).
+		Watches(
+			&corev1.Service{},
+			handler.EnqueueRequestsFromMapFunc(r.mapServiceToAdoptions),
 			builder.WithPredicates(),
 		).
 		Named("ifaas-knativeadoption").
@@ -303,4 +363,20 @@ func (r *KnativeAdoptionReconciler) mapDeploymentToAdoptions(ctx context.Context
 		}
 	}
 	return out
+}
+
+// mapServiceToAdoptions wakes the reconciler whenever a same-name core/Service
+// is created or deleted in a namespace that hosts a KnativeAdoption. The match
+// is by exact name because the operator always uses the CR name as the KSvc
+// name and the KSvc-derived Service inherits that name.
+func (r *KnativeAdoptionReconciler) mapServiceToAdoptions(ctx context.Context, obj client.Object) []reconcile.Request {
+	svc, ok := obj.(*corev1.Service)
+	if !ok {
+		return nil
+	}
+	a := &ifaasv1alpha1.KnativeAdoption{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}, a); err != nil {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: a.Namespace, Name: a.Name}}}
 }

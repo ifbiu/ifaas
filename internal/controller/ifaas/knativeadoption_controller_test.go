@@ -101,7 +101,7 @@ var _ = Describe("KnativeAdoptionReconciler", func() {
 		const name = "ghost"
 
 		AfterEach(func() {
-			_ = k8sClient.Delete(ictx, &ifaasv1alpha1.KnativeAdoption{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+			cleanupAdoption(ictx, name, ns)
 		})
 
 		It("marks SourceMissing and requeues", func() {
@@ -122,7 +122,7 @@ var _ = Describe("KnativeAdoptionReconciler", func() {
 		const name = "hello"
 
 		AfterEach(func() {
-			_ = k8sClient.Delete(ictx, &ifaasv1alpha1.KnativeAdoption{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+			cleanupAdoption(ictx, name, ns)
 			_ = k8sClient.Delete(ictx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
 			_ = k8sClient.Delete(ictx, &kservingv1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
 		})
@@ -213,7 +213,7 @@ var _ = Describe("KnativeAdoptionReconciler", func() {
 		const name = "bad"
 
 		AfterEach(func() {
-			_ = k8sClient.Delete(ictx, &ifaasv1alpha1.KnativeAdoption{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+			cleanupAdoption(ictx, name, ns)
 			_ = k8sClient.Delete(ictx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
 		})
 
@@ -238,5 +238,30 @@ var _ = Describe("KnativeAdoptionReconciler", func() {
 	})
 })
 
-// keep import in case future tests need it
-var _ = client.IgnoreNotFound
+// cleanupAdoption strips the restore-source-service finalizer (S5) and waits
+// for the apiserver to actually garbage-collect the object, so the next test
+// can re-create the same name without hitting AlreadyExists.
+//
+// Implementation notes:
+//   - `client.MergeFrom(a.DeepCopy())` + `a.Finalizers = nil` cannot be relied
+//     on because `Finalizers` is `omitempty`: after marshalling the modified
+//     side loses the key, so the computed JSON merge patch is not guaranteed
+//     to contain `"finalizers":null`. We use `client.RawPatch` with explicit
+//     JSON instead, which is the contract the apiserver actually understands.
+//   - We poll until the object is NotFound; once finalizers are gone the
+//     apiserver removes it within a single round-trip, but envtest is async
+//     enough that a tight loop here keeps test sequencing deterministic.
+func cleanupAdoption(ctx context.Context, name, ns string) {
+	stripFinalizers := client.RawPatch(types.MergePatchType, []byte(`{"metadata":{"finalizers":null}}`))
+	a := &ifaasv1alpha1.KnativeAdoption{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, a); err == nil {
+		if len(a.Finalizers) > 0 {
+			_ = k8sClient.Patch(ctx, a, stripFinalizers)
+		}
+	}
+	_ = k8sClient.Delete(ctx, &ifaasv1alpha1.KnativeAdoption{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+	Eventually(func() bool {
+		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &ifaasv1alpha1.KnativeAdoption{})
+		return apierrors.IsNotFound(err)
+	}, 5*time.Second, 50*time.Millisecond).Should(BeTrue())
+}
