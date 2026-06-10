@@ -47,6 +47,14 @@ rules:
   - patch
   - update
 - apiGroups:
+  - autoscaling
+  resources:
+  - horizontalpodautoscalers
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - ifaas.ifbiu.com
   resources:
   - knativeadoptions
