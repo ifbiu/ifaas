@@ -39,6 +39,7 @@ import (
 
 	ifaasv1alpha1 "github.com/ifbiu/ifaas/api/ifaas/v1alpha1"
 	ifaascontroller "github.com/ifbiu/ifaas/internal/controller/ifaas"
+	"github.com/ifbiu/ifaas/internal/flusher"
 	"github.com/ifbiu/ifaas/internal/scaledown"
 	webhookifaasv1alpha1 "github.com/ifbiu/ifaas/internal/webhook/ifaas/v1alpha1"
 	// +kubebuilder:scaffold:imports
@@ -189,10 +190,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	guardFlusher := flusher.New(
+		flusher.Config{},
+		&ifaascontroller.KSvcMinScalePatcher{Client: mgr.GetClient()},
+		ifaascontroller.NewLogOnlyFailureSink(),
+	)
+	defer guardFlusher.Stop()
+
 	if err := (&ifaascontroller.KnativeAdoptionReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Prober: prober,
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Prober:  prober,
+		Flusher: guardFlusher,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "ifaas-knativeadoption")
 		os.Exit(1)

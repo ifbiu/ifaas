@@ -39,6 +39,7 @@ import (
 	kservingv1 "knative.dev/serving/pkg/apis/serving/v1"
 
 	ifaasv1alpha1 "github.com/ifbiu/ifaas/api/ifaas/v1alpha1"
+	"github.com/ifbiu/ifaas/internal/flusher"
 	"github.com/ifbiu/ifaas/internal/scaledown"
 	"github.com/ifbiu/ifaas/internal/translator"
 )
@@ -71,6 +72,21 @@ type KnativeAdoptionReconciler struct {
 	// to disable the guard (e.g. in unit tests that do not exercise it);
 	// production wires up scaledown.HTTPProber against pods/proxy.
 	Prober scaledown.Prober
+
+	// Flusher coalesces min-scale PATCHes per namespace (S7). Leave nil to
+	// fall back to the S6 single-object behaviour where the SSA pass after
+	// the guard pre-pass carries the new min-scale into the KSvc. When set,
+	// the guard hands its decision to the Flusher and the SSA pass is left
+	// to drive only structural changes; either way the apiserver lands the
+	// same desired value, so the two paths are observably equivalent.
+	Flusher FlusherEnqueuer
+}
+
+// FlusherEnqueuer is the subset of *flusher.Manager the reconciler needs. It
+// is exposed as an interface so unit tests can record decisions without
+// spinning up a real Manager + Patcher.
+type FlusherEnqueuer interface {
+	Enqueue(flusher.Decision) error
 }
 
 // +kubebuilder:rbac:groups=ifaas.ifbiu.com,resources=knativeadoptions,verbs=get;list;watch;create;update;patch;delete

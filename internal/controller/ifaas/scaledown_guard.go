@@ -28,6 +28,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	ifaasv1alpha1 "github.com/ifbiu/ifaas/api/ifaas/v1alpha1"
+	"github.com/ifbiu/ifaas/internal/flusher"
 	"github.com/ifbiu/ifaas/internal/scaledown"
 )
 
@@ -126,9 +127,11 @@ func (r *KnativeAdoptionReconciler) runScaleDownGuard(ctx context.Context, adopt
 		setCondition(adoption, ifaasv1alpha1.ConditionScaleDownAllowed,
 			metav1.ConditionTrue, ReasonScaleDownAllowed, msg)
 		clearConditionIfReason(adoption, ifaasv1alpha1.ConditionDegraded, ReasonScaleDownProbeError)
+		r.enqueueMinScale(adoption, 0, "scaledownz=true")
 	case scaledown.OutcomeBlock:
 		setCondition(adoption, ifaasv1alpha1.ConditionScaleDownAllowed,
 			metav1.ConditionFalse, ReasonScaleDownBlocked, msg)
+		r.enqueueMinScale(adoption, 1, ReasonScaleDownBlocked)
 	case scaledown.OutcomeNoPods:
 		// All pods are already gone (e.g. KSvc has scaled to zero). The
 		// guard cannot assert anything; keep the previous condition value so
@@ -270,4 +273,21 @@ func maybeMarkDegraded(a *ifaasv1alpha1.KnativeAdoption, threshold int32) {
 func guardRequeueAfter(a *ifaasv1alpha1.KnativeAdoption) time.Duration {
 	_, interval, _, _ := guardConfig(a)
 	return interval
+}
+
+// enqueueMinScale hands a min-scale decision off to the namespace flusher.
+// If no flusher is wired (unit tests, single-object S6 mode), the helper is
+// a no-op and the trailing SSA pass in reconcileAdoption is solely
+// responsible for landing the value on the KSvc.
+func (r *KnativeAdoptionReconciler) enqueueMinScale(a *ifaasv1alpha1.KnativeAdoption, desired int32, reason string) {
+	if r.Flusher == nil {
+		return
+	}
+	_ = r.Flusher.Enqueue(flusher.Decision{
+		Namespace:       a.Namespace,
+		KSvcName:        a.Name,
+		AdoptionName:    a.Name,
+		DesiredMinScale: desired,
+		Reason:          reason,
+	})
 }
