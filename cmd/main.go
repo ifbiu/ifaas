@@ -189,6 +189,13 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "ifaas-knativeadoption")
 		os.Exit(1)
 	}
+	if err := (&ifaascontroller.DeploymentWatcher{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "ifaas-deployment-watcher")
+		os.Exit(1)
+	}
 	//nolint:goconst
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
 		if err := webhookifaasv1alpha1.SetupKnativeAdoptionWebhookWithManager(mgr); err != nil {
