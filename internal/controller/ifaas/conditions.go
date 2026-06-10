@@ -35,6 +35,13 @@ const (
 	ReasonServiceSwapTypeRefuse = "ServiceTypeNotSupported"
 	ReasonServiceSwapOwnedByOS  = "ServiceOwnedByExternal"
 	ReasonServiceSwapDeleteFail = "ServiceDeleteFailed"
+
+	// ScaleDownGuard reasons.
+	ReasonScaleDownAllowed    = "ScaleDownAllowed"
+	ReasonScaleDownBlocked    = "ScaleDownBlocked"
+	ReasonScaleDownNoPods     = "ScaleDownNoPods"
+	ReasonScaleDownProbeError = "ScaleDownProbeError"
+	ReasonGuardSkipped        = "GuardSkipped"
 )
 
 // FieldOwner used for server-side apply of operator-owned KSvc objects.

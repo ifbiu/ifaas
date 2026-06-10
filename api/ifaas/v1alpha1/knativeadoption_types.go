@@ -46,13 +46,19 @@ const (
 
 // ProbeResult is the tri-state outcome of a /scaledownz guard cycle.
 //
-// +kubebuilder:validation:Enum=true;false;unknown
+// Values are capitalised on purpose: kubebuilder marker `Enum=true;false;...`
+// emits OpenAPI booleans for `true`/`false`, which the apiserver then refuses
+// to match against a string field. Picking `True` / `False` / `Unknown`
+// sidesteps the YAML type-inference trap and matches Kubernetes convention
+// for status enums (e.g. corev1.ConditionStatus).
+//
+// +kubebuilder:validation:Enum=True;False;Unknown
 type ProbeResult string
 
 const (
-	ProbeResultTrue    ProbeResult = "true"
-	ProbeResultFalse   ProbeResult = "false"
-	ProbeResultUnknown ProbeResult = "unknown"
+	ProbeResultTrue    ProbeResult = "True"
+	ProbeResultFalse   ProbeResult = "False"
+	ProbeResultUnknown ProbeResult = "Unknown"
 )
 
 // Condition type constants written into KnativeAdoption.status.conditions.
@@ -213,6 +219,14 @@ type ProbeStatus struct {
 
 	// +optional
 	Message string `json:"message,omitempty"`
+
+	// ConsecutiveErrors counts back-to-back guard rounds in which at least
+	// one pod probe failed at the transport layer (timeout, 5xx, unreachable).
+	// It is reset to zero on any error-free round. When it reaches
+	// spec.scaleDownProbe.consecutiveFailureThreshold the reconciler raises
+	// the Degraded condition.
+	// +optional
+	ConsecutiveErrors int32 `json:"consecutiveErrors,omitempty"`
 }
 
 // KnativeAdoptionStatus defines the observed state of KnativeAdoption.

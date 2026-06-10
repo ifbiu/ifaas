@@ -375,3 +375,51 @@ func TestTranslate_PodLevelPassthrough(t *testing.T) {
 		t.Errorf("tolerations not passthrough: %#v", ps.Tolerations)
 	}
 }
+
+// --- effective min-scale (S6 contract) ---------------------------------
+
+func TestEffectiveMinScale(t *testing.T) {
+	probeFalse := &ifaasv1alpha1.ProbeStatus{Result: ifaasv1alpha1.ProbeResultFalse}
+	probeTrue := &ifaasv1alpha1.ProbeStatus{Result: ifaasv1alpha1.ProbeResultTrue}
+	probeUnknown := &ifaasv1alpha1.ProbeStatus{Result: ifaasv1alpha1.ProbeResultUnknown}
+
+	tests := []struct {
+		name  string
+		spec  *int32
+		probe *ifaasv1alpha1.ProbeStatus
+		want  int32
+	}{
+		{"spec nil, no probe -> 0", nil, nil, 0},
+		{"spec 0, no probe -> 0", ptrInt32(0), nil, 0},
+		{"spec 0, probe true -> 0", ptrInt32(0), probeTrue, 0},
+		{"spec 0, probe unknown -> 0", ptrInt32(0), probeUnknown, 0},
+		{"spec 0, probe false -> 1 (guard pin)", ptrInt32(0), probeFalse, 1},
+		{"spec 2, probe false -> 2 (spec wins above 0)", ptrInt32(2), probeFalse, 2},
+		{"spec 3, probe true -> 3", ptrInt32(3), probeTrue, 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := newAdoption("hello", "default", func(a *ifaasv1alpha1.KnativeAdoption) {
+				a.Spec.Autoscaling.MinScale = tt.spec
+				a.Status.LastScaleDownProbe = tt.probe
+			})
+			if got := EffectiveMinScale(a); got != tt.want {
+				t.Errorf("EffectiveMinScale = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTranslate_MinScaleFollowsProbe(t *testing.T) {
+	dep := newDeployment("hello", "default", []corev1.Container{basicContainer("app", 8080)})
+	a := newAdoption("hello", "default", func(a *ifaasv1alpha1.KnativeAdoption) {
+		a.Status.LastScaleDownProbe = &ifaasv1alpha1.ProbeStatus{Result: ifaasv1alpha1.ProbeResultFalse}
+	})
+	ksvc, err := Translate(dep, a)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := ksvc.Spec.Template.Annotations[AutoscalingMinScaleAnnotation]; got != "1" {
+		t.Errorf("guard-pinned min-scale should be 1, got %q", got)
+	}
+}

@@ -39,6 +39,7 @@ import (
 	kservingv1 "knative.dev/serving/pkg/apis/serving/v1"
 
 	ifaasv1alpha1 "github.com/ifbiu/ifaas/api/ifaas/v1alpha1"
+	"github.com/ifbiu/ifaas/internal/scaledown"
 	"github.com/ifbiu/ifaas/internal/translator"
 )
 
@@ -65,6 +66,11 @@ type KnativeAdoptionReconciler struct {
 	// (ready, url). The default reads kservingv1.ServiceConditionReady.
 	// Overridable from unit tests where no Knative controller is running.
 	ServiceReady func(*kservingv1.Service) (bool, string)
+
+	// Prober runs one /scaledownz round per pod for the S6 guard. Leave nil
+	// to disable the guard (e.g. in unit tests that do not exercise it);
+	// production wires up scaledown.HTTPProber against pods/proxy.
+	Prober scaledown.Prober
 }
 
 // +kubebuilder:rbac:groups=ifaas.ifbiu.com,resources=knativeadoptions,verbs=get;list;watch;create;update;patch;delete
@@ -74,6 +80,8 @@ type KnativeAdoptionReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=get;patch;update
 // +kubebuilder:rbac:groups=serving.knative.dev,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;delete;create
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods/proxy,verbs=get
 
 // Reconcile implements the adoption pipeline described in
 // docs/knative-autopilot-impl-plan.md §S3.
@@ -138,6 +146,14 @@ func (r *KnativeAdoptionReconciler) reconcileAdoption(ctx context.Context, adopt
 	}
 	apimeta.RemoveStatusCondition(&adoption.Status.Conditions, ifaasv1alpha1.ConditionSourceMissing)
 
+	// Step 1.5 (S6): /scaledownz guard pre-pass.
+	//
+	// Run BEFORE Translate so the translator can read the fresh
+	// status.lastScaleDownProbe and derive the right `min-scale` annotation
+	// in a single SSA. The pre-pass is a no-op on the very first reconcile
+	// (no KSvc yet) and on CRs that pinned minScale > 0.
+	r.maybeRunGuard(ctx, adoption)
+
 	// Step 2: translate.
 	ksvc, err := translator.Translate(dep, adoption)
 	if err != nil {
@@ -182,7 +198,7 @@ func (r *KnativeAdoptionReconciler) reconcileAdoption(ctx context.Context, adopt
 		setReady(adoption, metav1.ConditionFalse, ReasonServiceApplyFailed, err.Error())
 		return ctrl.Result{}, err
 	}
-	apimeta.RemoveStatusCondition(&adoption.Status.Conditions, ifaasv1alpha1.ConditionDegraded)
+	clearConditionIfReason(adoption, ifaasv1alpha1.ConditionDegraded, ReasonServiceApplyFailed)
 	setCondition(adoption, ifaasv1alpha1.ConditionAdopted, metav1.ConditionTrue, ReasonAdopted, "KnativeService applied")
 
 	// Re-fetch the live KSvc so we observe Knative-written status fields.
@@ -209,7 +225,37 @@ func (r *KnativeAdoptionReconciler) reconcileAdoption(ctx context.Context, adopt
 	setCondition(adoption, ifaasv1alpha1.ConditionSourceQuiesced, metav1.ConditionTrue, ReasonSourceQuiesced, "Deployment scaled to 0")
 
 	setReady(adoption, metav1.ConditionTrue, ReasonAdopted, "adoption complete")
+
+	// Requeue at the guard interval so the next /scaledownz round runs even
+	// when no other watch fires. Disabled (RequeueAfter=0) when the guard is
+	// turned off for this CR.
+	if guardEnabled(adoption) {
+		return ctrl.Result{RequeueAfter: guardRequeueAfter(adoption)}, nil
+	}
 	return ctrl.Result{}, nil
+}
+
+// maybeRunGuard wires the S6 guard into the front of the reconcile pass when
+// (a) the user opted into scale-to-zero (minScale==0), (b) the KSvc already
+// exists from a previous reconcile, and (c) the live KSvc reports Ready. The
+// helper writes nothing to the apiserver itself; it mutates adoption.Status
+// in place and the outer status patch carries the change to etcd.
+func (r *KnativeAdoptionReconciler) maybeRunGuard(ctx context.Context, adoption *ifaasv1alpha1.KnativeAdoption) {
+	if !guardEnabled(adoption) {
+		return
+	}
+	prev := &kservingv1.Service{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: adoption.Namespace, Name: adoption.Name}, prev)
+	if err != nil {
+		// First reconcile: no KSvc yet, nothing to probe against. Skip
+		// silently — the next reconcile (after SSA below) will see one.
+		return
+	}
+	ready, _ := r.serviceReady()(prev)
+	if !ready {
+		return
+	}
+	r.runScaleDownGuard(ctx, adoption)
 }
 
 func (r *KnativeAdoptionReconciler) getSourceDeployment(ctx context.Context, a *ifaasv1alpha1.KnativeAdoption) (*appsv1.Deployment, bool, error) {
@@ -274,6 +320,14 @@ func statusEqual(a, b *ifaasv1alpha1.KnativeAdoption) bool {
 			return false
 		}
 	}
+	// LastScaleDownProbe.Time alone is intentionally excluded: it ticks on
+	// every guard round, and patching status purely to bump the timestamp
+	// would multiply apiserver writes by the guard frequency. Comparing the
+	// semantically meaningful fields (Result, Message, ConsecutiveErrors)
+	// keeps patches tied to actual state transitions.
+	if !probeStatusEqual(a.Status.LastScaleDownProbe, b.Status.LastScaleDownProbe) {
+		return false
+	}
 	if len(a.Status.Conditions) != len(b.Status.Conditions) {
 		return false
 	}
@@ -284,6 +338,18 @@ func statusEqual(a, b *ifaasv1alpha1.KnativeAdoption) bool {
 		}
 	}
 	return true
+}
+
+func probeStatusEqual(a, b *ifaasv1alpha1.ProbeStatus) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Result == b.Result &&
+		a.Message == b.Message &&
+		a.ConsecutiveErrors == b.ConsecutiveErrors
 }
 
 func setCondition(a *ifaasv1alpha1.KnativeAdoption, t string, s metav1.ConditionStatus, reason, msg string) {
@@ -298,6 +364,23 @@ func setCondition(a *ifaasv1alpha1.KnativeAdoption, t string, s metav1.Condition
 
 func removeCondition(a *ifaasv1alpha1.KnativeAdoption, t string) {
 	apimeta.RemoveStatusCondition(&a.Status.Conditions, t)
+}
+
+// clearConditionIfReason removes condition `t` only when its current Reason
+// matches one of `reasons`. Used for multi-source sticky signals such as
+// ConditionDegraded, where each writer (guard / apply / swap) must clear only
+// the cause it owns instead of stomping the others' state.
+func clearConditionIfReason(a *ifaasv1alpha1.KnativeAdoption, t string, reasons ...string) {
+	c := apimeta.FindStatusCondition(a.Status.Conditions, t)
+	if c == nil {
+		return
+	}
+	for _, r := range reasons {
+		if c.Reason == r {
+			apimeta.RemoveStatusCondition(&a.Status.Conditions, t)
+			return
+		}
+	}
 }
 
 func setReady(a *ifaasv1alpha1.KnativeAdoption, s metav1.ConditionStatus, reason, msg string) {

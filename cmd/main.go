@@ -39,6 +39,7 @@ import (
 
 	ifaasv1alpha1 "github.com/ifbiu/ifaas/api/ifaas/v1alpha1"
 	ifaascontroller "github.com/ifbiu/ifaas/internal/controller/ifaas"
+	"github.com/ifbiu/ifaas/internal/scaledown"
 	webhookifaasv1alpha1 "github.com/ifbiu/ifaas/internal/webhook/ifaas/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
@@ -182,9 +183,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	prober, err := scaledown.NewHTTPProber(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "Failed to build /scaledownz prober")
+		os.Exit(1)
+	}
+
 	if err := (&ifaascontroller.KnativeAdoptionReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		Prober: prober,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "ifaas-knativeadoption")
 		os.Exit(1)

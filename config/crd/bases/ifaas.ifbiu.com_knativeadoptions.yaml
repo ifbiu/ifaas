@@ -250,15 +250,30 @@ spec:
                 description: LastScaleDownProbe is the most recent /scaledownz guard
                   outcome.
                 properties:
+                  consecutiveErrors:
+                    description: |-
+                      ConsecutiveErrors counts back-to-back guard rounds in which at least
+                      one pod probe failed at the transport layer (timeout, 5xx, unreachable).
+                      It is reset to zero on any error-free round. When it reaches
+                      spec.scaleDownProbe.consecutiveFailureThreshold the reconciler raises
+                      the Degraded condition.
+                    format: int32
+                    type: integer
                   message:
                     type: string
                   result:
-                    description: ProbeResult is the tri-state outcome of a /scaledownz
-                      guard cycle.
+                    description: |-
+                      ProbeResult is the tri-state outcome of a /scaledownz guard cycle.
+
+                      Values are capitalised on purpose: kubebuilder marker `Enum=true;false;...`
+                      emits OpenAPI booleans for `true`/`false`, which the apiserver then refuses
+                      to match against a string field. Picking `True` / `False` / `Unknown`
+                      sidesteps the YAML type-inference trap and matches Kubernetes convention
+                      for status enums (e.g. corev1.ConditionStatus).
                     enum:
-                    - true
-                    - false
-                    - unknown
+                    - "True"
+                    - "False"
+                    - Unknown
                     type: string
                   time:
                     format: date-time

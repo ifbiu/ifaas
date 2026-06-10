@@ -158,11 +158,7 @@ func pickUserPort(c corev1.Container) (int32, error) {
 
 func buildKPAAnnotations(a *ifaasv1alpha1.KnativeAdoption) map[string]string {
 	ann := map[string]string{}
-	if a.Spec.Autoscaling.MinScale != nil {
-		ann[AutoscalingMinScaleAnnotation] = strconv.FormatInt(int64(*a.Spec.Autoscaling.MinScale), 10)
-	} else {
-		ann[AutoscalingMinScaleAnnotation] = "0"
-	}
+	ann[AutoscalingMinScaleAnnotation] = strconv.FormatInt(int64(EffectiveMinScale(a)), 10)
 	if a.Spec.Autoscaling.MaxScale != nil {
 		ann[AutoscalingMaxScaleAnnotation] = strconv.FormatInt(int64(*a.Spec.Autoscaling.MaxScale), 10)
 	}
@@ -170,6 +166,38 @@ func buildKPAAnnotations(a *ifaasv1alpha1.KnativeAdoption) map[string]string {
 		ann[AutoscalingTargetAnnotation] = strconv.FormatInt(int64(*a.Spec.Autoscaling.TargetConcurrency), 10)
 	}
 	return ann
+}
+
+// EffectiveMinScale is the single source of truth for the
+// `autoscaling.knative.dev/min-scale` annotation written onto the KSvc.
+//
+// Inputs (priority, top wins):
+//  1. Latest /scaledownz round refused scale-to-zero
+//     (status.lastScaleDownProbe.Result == "false") → "1"
+//  2. spec.autoscaling.minScale, defaulting to 0 when unset
+//
+// Rule (1) only applies when the user-declared baseline is 0; when the user
+// already pinned minScale ≥ 1, the guard is irrelevant — there is nothing to
+// gate against. Keeping this derivation pure (status → annotation, never the
+// reverse) means SSA always reapplies the same value and the field-owner
+// contract stays uncontested across reconcile cycles. See impl-plan §S6.
+func EffectiveMinScale(a *ifaasv1alpha1.KnativeAdoption) int32 {
+	base := int32(0)
+	if a.Spec.Autoscaling.MinScale != nil {
+		base = *a.Spec.Autoscaling.MinScale
+	}
+	if base == 0 && guardBlocked(a) {
+		return 1
+	}
+	return base
+}
+
+func guardBlocked(a *ifaasv1alpha1.KnativeAdoption) bool {
+	probe := a.Status.LastScaleDownProbe
+	if probe == nil {
+		return false
+	}
+	return probe.Result == ifaasv1alpha1.ProbeResultFalse
 }
 
 func buildUserContainer(src corev1.Container, a *ifaasv1alpha1.KnativeAdoption, port int32) corev1.Container {
