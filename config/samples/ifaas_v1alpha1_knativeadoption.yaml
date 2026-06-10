@@ -1,0 +1,21 @@
+apiVersion: ifaas.ifbiu.com/v1alpha1
+kind: KnativeAdoption
+metadata:
+  labels:
+    app.kubernetes.io/name: ifaas
+    app.kubernetes.io/managed-by: kustomize
+  name: knativeadoption-sample
+spec:
+  sourceRef:
+    kind: Deployment
+    name: hello-app
+  mode: serving
+  autoscaling:
+    minScale: 0
+    maxScale: 10
+    targetConcurrency: 10
+  scaleDownProbe:
+    path: /scaledownz
+    intervalSeconds: 30
+    timeoutSeconds: 2
+    consecutiveFailureThreshold: 20

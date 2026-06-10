@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- ifaas_v1alpha1_knativeadoption.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
