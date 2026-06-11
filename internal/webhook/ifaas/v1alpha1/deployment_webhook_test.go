@@ -22,6 +22,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -80,5 +81,47 @@ var _ = Describe("Deployment Webhook", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "dw-other", Namespace: ns}, got)).To(Succeed())
 		got.Spec.Template.Spec.Containers[0].Image = "registry.example/echo:v2"
 		Expect(k8sClient.Update(ctx, got)).To(Succeed())
+	})
+
+	// SA bypass: the operator's S9 finalizer chain restores adopted
+	// Deployments by writing 0→>=1; the same write from any other client
+	// is the manual scale-up the webhook is supposed to refuse. The
+	// validator distinguishes them by AdmissionRequest.UserInfo.Username,
+	// so we drive both halves with two impersonating clients.
+	//
+	// Both impersonations carry the system:masters group so RBAC stops
+	// gating the request: this isolates the test to webhook behaviour
+	// (UserInfo.Username matching), which is what we want to assert.
+	It("admits 0 → >0 from the ifaas controller SA, rejects from anyone else", func() {
+		dep := makeDeployment("dw-sa-bypass", ns, 0, true)
+		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+
+		ctrlCfg := rest.CopyConfig(cfg)
+		ctrlCfg.Impersonate = rest.ImpersonationConfig{
+			UserName: testControllerUsername,
+			Groups:   []string{"system:masters"},
+		}
+		ctrlClient, err := client.New(ctrlCfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(err).NotTo(HaveOccurred())
+
+		userCfg := rest.CopyConfig(cfg)
+		userCfg.Impersonate = rest.ImpersonationConfig{
+			UserName: "alice@example.com",
+			Groups:   []string{"system:masters"},
+		}
+		userClient, err := client.New(userCfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(err).NotTo(HaveOccurred())
+
+		got := &appsv1.Deployment{}
+		Expect(userClient.Get(ctx, types.NamespacedName{Name: "dw-sa-bypass", Namespace: ns}, got)).To(Succeed())
+		r := int32(1)
+		got.Spec.Replicas = &r
+		Expect(userClient.Update(ctx, got)).NotTo(Succeed(),
+			"non-controller users must still hit the 0→>0 ban")
+
+		Expect(ctrlClient.Get(ctx, types.NamespacedName{Name: "dw-sa-bypass", Namespace: ns}, got)).To(Succeed())
+		got.Spec.Replicas = &r
+		Expect(ctrlClient.Update(ctx, got)).To(Succeed(),
+			"the ifaas controller SA must be admitted so the S9 restore chain can complete")
 	})
 })

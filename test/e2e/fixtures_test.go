@@ -10,6 +10,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -39,15 +40,160 @@ func metav1Get() metav1.GetOptions   { return metav1.GetOptions{} }
 // block, registers cleanup, and returns its name. We rely on Ginkgo's
 // per-spec deferred cleanup so a failing spec still tears down what it
 // owns — the next run starts clean.
+//
+// On spec failure the cleanup hook also dumps a focused diagnostic of
+// the namespace (KSvc/Revision/Configuration/Route, KnativeAdoption,
+// Pod, Events) to GinkgoWriter so the next investigator does not need
+// to chase a 180-second window with a parallel terminal.
 func withNamespace(prefix string) string {
 	name := fmt.Sprintf("%s-%s", prefix, strings.ToLower(rand.String(6)))
 	By("creating namespace " + name)
 	_, err := utils.CreateNamespace(ctxBackground(), clients.Typed, name)
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(func() {
+		if r := CurrentSpecReport(); r.Failed() {
+			dumpDiagnostics(name)
+		}
 		_ = utils.DeleteNamespace(ctxBackground(), clients.Typed, name, 90*time.Second)
 	})
 	return name
+}
+
+// ----- failure diagnostics -------------------------------------------------
+
+// dumpDiagnostics writes everything we'd want to know about why a spec
+// stalled in `ns` to GinkgoWriter. It is deliberately defensive: any
+// individual lookup may fail (CRD missing, API not registered, ns
+// already gone) without aborting the rest of the dump.
+func dumpDiagnostics(ns string) {
+	w := GinkgoWriter
+	fmt.Fprintf(w, "\n========== diagnostics for ns/%s ==========\n", ns)
+	defer fmt.Fprintf(w, "========== end diagnostics ns/%s ==========\n\n", ns)
+
+	dumpUnstructured(w, "KnativeAdoption", utils.GVRKnativeAdoption, ns)
+	dumpAdoptionMeta(w, ns)
+	dumpUnstructured(w, "KSvc", utils.GVRService, ns)
+	dumpUnstructured(w, "Revision", utils.GVRRevision, ns)
+	dumpUnstructured(w, "Configuration", schema.GroupVersionResource{
+		Group: "serving.knative.dev", Version: "v1", Resource: "configurations"}, ns)
+	dumpUnstructured(w, "Route", schema.GroupVersionResource{
+		Group: "serving.knative.dev", Version: "v1", Resource: "routes"}, ns)
+
+	if deps, err := clients.Typed.AppsV1().Deployments(ns).List(ctxBackground(), metav1.ListOptions{}); err == nil {
+		for _, d := range deps.Items {
+			fmt.Fprintf(w, "Deployment %s: replicas spec=%v status=%d available=%d\n",
+				d.Name, d.Spec.Replicas, d.Status.Replicas, d.Status.AvailableReplicas)
+		}
+	}
+
+	if pods, err := clients.Typed.CoreV1().Pods(ns).List(ctxBackground(), metav1.ListOptions{}); err == nil {
+		for _, p := range pods.Items {
+			reason := "-"
+			if len(p.Status.ContainerStatuses) > 0 {
+				if s := p.Status.ContainerStatuses[0].State.Waiting; s != nil {
+					reason = s.Reason + ": " + s.Message
+				}
+			}
+			fmt.Fprintf(w, "Pod %s phase=%s reason=%q\n", p.Name, p.Status.Phase, reason)
+		}
+	}
+
+	if evs, err := clients.Typed.CoreV1().Events(ns).List(ctxBackground(),
+		metav1.ListOptions{Limit: 25}); err == nil {
+		for _, e := range evs.Items {
+			fmt.Fprintf(w, "Event %s/%s [%s] %s: %s\n",
+				e.InvolvedObject.Kind, e.InvolvedObject.Name, e.Type, e.Reason, e.Message)
+		}
+	}
+
+	dumpControllerLogs(w)
+}
+
+// dumpAdoptionMeta surfaces the deletion-path metadata that conditions
+// alone do not show: deletionTimestamp, finalizers, ownerReferences. A
+// CR sitting at "Ready=True/Adopted" right after Delete usually means
+// either the finalizer never fired or status writes were rolled back —
+// these three fields decide which.
+func dumpAdoptionMeta(w io.Writer, ns string) {
+	list, err := clients.Dynamic.Resource(utils.GVRKnativeAdoption).Namespace(ns).
+		List(ctxBackground(), metav1.ListOptions{})
+	if err != nil {
+		fmt.Fprintf(w, "KnativeAdoption meta list error: %v\n", err)
+		return
+	}
+	for _, it := range list.Items {
+		dt, _, _ := unstructured.NestedString(it.Object, "metadata", "deletionTimestamp")
+		fins, _, _ := unstructured.NestedStringSlice(it.Object, "metadata", "finalizers")
+		labels, _, _ := unstructured.NestedStringMap(it.Object, "metadata", "labels")
+		fmt.Fprintf(w, "KnativeAdoption %s meta: deletionTimestamp=%q finalizers=%v labels=%v\n",
+			it.GetName(), dt, fins, labels)
+	}
+}
+
+// dumpControllerLogs pulls the last ~200 lines from every
+// ifaas-controller-manager pod. The deletion-path bug surface is
+// almost always visible there (handleDeletion error, status patch
+// failure, restore webhook denial) and chasing it without these lines
+// means re-running the suite blind.
+func dumpControllerLogs(w io.Writer) {
+	const sysNS = "ifaas-system"
+	pods, err := clients.Typed.CoreV1().Pods(sysNS).List(ctxBackground(), metav1.ListOptions{
+		LabelSelector: "control-plane=controller-manager",
+	})
+	if err != nil {
+		fmt.Fprintf(w, "controller-manager pod list error: %v\n", err)
+		return
+	}
+	tail := int64(200)
+	for _, p := range pods.Items {
+		fmt.Fprintf(w, "----- controller-manager logs (%s) -----\n", p.Name)
+		req := clients.Typed.CoreV1().Pods(sysNS).GetLogs(p.Name, &corev1.PodLogOptions{
+			Container: "manager",
+			TailLines: &tail,
+		})
+		stream, err := req.Stream(ctxBackground())
+		if err != nil {
+			fmt.Fprintf(w, "  log stream error: %v\n", err)
+			continue
+		}
+		_, _ = io.Copy(w, stream)
+		_ = stream.Close()
+		fmt.Fprintf(w, "----- end controller-manager logs (%s) -----\n", p.Name)
+	}
+}
+
+// dumpUnstructured prints a one-line status summary for every object
+// of `gvr` in `ns`. We only render conditions because that is the
+// only field the operator actually waits on.
+func dumpUnstructured(w io.Writer, kind string, gvr schema.GroupVersionResource, ns string) {
+	list, err := clients.Dynamic.Resource(gvr).Namespace(ns).List(ctxBackground(), metav1.ListOptions{})
+	if err != nil {
+		fmt.Fprintf(w, "%s: list error: %v\n", kind, err)
+		return
+	}
+	for _, it := range list.Items {
+		conds, _, _ := unstructured.NestedSlice(it.Object, "status", "conditions")
+		var parts []string
+		for _, c := range conds {
+			m, _ := c.(map[string]any)
+			t, _ := m["type"].(string)
+			s, _ := m["status"].(string)
+			r, _ := m["reason"].(string)
+			msg, _ := m["message"].(string)
+			line := fmt.Sprintf("%s=%s", t, s)
+			if r != "" {
+				line += "/" + r
+			}
+			if msg != "" {
+				if len(msg) > 120 {
+					msg = msg[:120] + "…"
+				}
+				line += "(" + msg + ")"
+			}
+			parts = append(parts, line)
+		}
+		fmt.Fprintf(w, "%s %s: %s\n", kind, it.GetName(), strings.Join(parts, "; "))
+	}
 }
 
 // ----- workload Deployment -------------------------------------------------

@@ -85,7 +85,8 @@ setup-test-e2e: ## Prepare cluster + images for e2e according to E2E_RUNTIME.
 			$(MAKE) docker-build IMG=$(E2E_IMG); \
 			$(MAKE) stub-build  IMG=$(E2E_STUB_IMG); \
 			$(KIND) load docker-image $(E2E_IMG)      --name $(KIND_CLUSTER); \
-			$(KIND) load docker-image $(E2E_STUB_IMG) --name $(KIND_CLUSTER) ;; \
+			$(KIND) load docker-image $(E2E_STUB_IMG) --name $(KIND_CLUSTER); \
+			$(MAKE) kind-knative-skip-tag-resolving ;; \
 		k3s) \
 			$(MAKE) docker-build IMG=$(E2E_IMG); \
 			$(MAKE) stub-build   IMG=$(E2E_STUB_IMG); \
@@ -99,10 +100,8 @@ setup-test-e2e: ## Prepare cluster + images for e2e according to E2E_RUNTIME.
 	esac
 	$(MAKE) install
 	$(MAKE) deploy IMG=$(E2E_IMG)
-	@if [ "$(E2E_RUNTIME)" = "external" ] || [ "$(E2E_RUNTIME)" = "k3s" ]; then \
-		echo "force-rolling controller-manager so the new image is picked up (same tag, IfNotPresent)"; \
-		"$(KUBECTL)" -n ifaas-system rollout restart deploy/ifaas-controller-manager; \
-	fi
+	@echo "force-rolling controller-manager so the new image is picked up (same tag, IfNotPresent)"
+	"$(KUBECTL)" -n ifaas-system rollout restart deploy/ifaas-controller-manager
 	"$(KUBECTL)" -n ifaas-system rollout status deploy/ifaas-controller-manager --timeout=180s
 
 .PHONY: stub-build
@@ -119,10 +118,21 @@ k3s-load: ## Import IMG into k3s built-in containerd (namespace k8s.io).
 		$(K3S_CTR) -n k8s.io images import "$$tmp"; \
 		rm -f "$$tmp"
 
+.PHONY: kind-knative-skip-tag-resolving
+kind-knative-skip-tag-resolving: ## Tell Knative to skip digest resolution for tags loaded via `kind load`.
+	@if ! "$(KUBECTL)" get ns knative-serving >/dev/null 2>&1; then \
+		echo "knative-serving namespace not found; install Knative Serving on the kind cluster first."; \
+		exit 1; \
+	fi
+	"$(KUBECTL)" -n knative-serving patch cm config-deployment --type=merge \
+		-p '{"data":{"registries-skipping-tag-resolving":"kind.local,ko.local,dev.local,index.docker.io"}}'
+	"$(KUBECTL)" -n knative-serving rollout restart deploy/controller
+	"$(KUBECTL)" -n knative-serving rollout status  deploy/controller --timeout=120s
+
 .PHONY: test-e2e
-test-e2e: manifests generate fmt vet setup-test-e2e ## Run the e2e tests against a real cluster.
+test-e2e: manifests generate fmt vet setup-test-e2e ## Run the e2e tests against a real cluster. Pass GINKGO_FLAGS='-ginkgo.focus="..."' to narrow the run.
 	E2E_RUNTIME=$(E2E_RUNTIME) E2E_NAMESPACE=$(E2E_NAMESPACE) E2E_IMG=$(E2E_IMG) E2E_STUB_IMG=$(E2E_STUB_IMG) \
-		go test -tags=e2e ./test/e2e/... -v -ginkgo.v -timeout=20m
+		go test -tags=e2e ./test/e2e/... -v -ginkgo.v -timeout=20m $(GINKGO_FLAGS)
 	@echo "[hint] run 'make cleanup-test-e2e' to drop the e2e namespace and ifaas deployment"
 
 .PHONY: cleanup-test-e2e

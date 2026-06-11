@@ -54,6 +54,13 @@ var (
 	testEnv   *envtest.Environment
 )
 
+// testControllerUsername is the apiserver username the Deployment webhook
+// recognises as "the operator's own restore writes" during this suite.
+// We pin it via the env var the production code reads so the webhook
+// behaves exactly as it would in-cluster, without leaking a test-only
+// constructor seam into the webhook itself.
+const testControllerUsername = "system:serviceaccount:ifaas-test:ifaas-controller-manager"
+
 func TestAPIs(t *testing.T) {
 	RegisterFailHandler(Fail)
 
@@ -70,6 +77,8 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 
 	// +kubebuilder:scaffold:scheme
+
+	Expect(os.Setenv(envControllerUsername, testControllerUsername)).To(Succeed())
 
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{

@@ -19,6 +19,7 @@ package v1alpha1
 import (
 	"context"
 	"fmt"
+	"os"
 
 	appsv1 "k8s.io/api/apps/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -33,6 +34,18 @@ import (
 const (
 	labelEnabled      = "ifaas.ifbiu.com/knative-autopilot"
 	labelEnabledValue = "enabled"
+)
+
+// envControllerUsername names the env var that pins the operator's own
+// kube-apiserver username so the Deployment validator can recognise its
+// own restore writes (S9) and let them through the 0→>0 ban. The default
+// matches the SA emitted by config/default/kustomization (namespace
+// prefix `ifaas-` + SA name `controller-manager`); production deployments
+// that rename either component must override the env var to keep the
+// finalizer chain unblocked.
+const (
+	envControllerUsername     = "IFAAS_CONTROLLER_USERNAME"
+	defaultControllerUsername = "system:serviceaccount:ifaas-system:ifaas-controller-manager"
 )
 
 // SetupDeploymentWebhookWithManager registers the validating webhook for
@@ -50,8 +63,12 @@ const (
 //     mis-edited admission manifest can never accidentally police more
 //     than the operator owns.
 func SetupDeploymentWebhookWithManager(mgr ctrl.Manager) error {
+	user := os.Getenv(envControllerUsername)
+	if user == "" {
+		user = defaultControllerUsername
+	}
 	return ctrl.NewWebhookManagedBy(mgr, &appsv1.Deployment{}).
-		WithValidator(&DeploymentCustomValidator{}).
+		WithValidator(&DeploymentCustomValidator{ControllerUsername: user}).
 		Complete()
 }
 
@@ -64,10 +81,20 @@ func SetupDeploymentWebhookWithManager(mgr ctrl.Manager) error {
 // up bypasses the guard's quiesced state and would re-introduce the very
 // race S5/S6 are designed to prevent.
 //
-// The validator is intentionally stateless: every decision is computed
-// from the inbound Deployment object alone. No apiserver round-trip is
-// needed, so it adds essentially zero latency to the admission path.
-type DeploymentCustomValidator struct{}
+// ControllerUsername names the operator's own kube-apiserver username.
+// The S9 restore chain — which intentionally writes 0→>=1 to revive the
+// source workload after a CR delete — would otherwise be self-blocked by
+// the same rule it enforces. Requests whose UserInfo matches this
+// username are admitted unconditionally; every other client (humans,
+// HPAs, GitOps controllers) still hits the 0→>0 ban.
+//
+// The validator is otherwise stateless: every decision is computed from
+// the inbound Deployment plus the AdmissionRequest in ctx. No apiserver
+// round-trip is needed, so it adds essentially zero latency to the
+// admission path.
+type DeploymentCustomValidator struct {
+	ControllerUsername string
+}
 
 // ValidateCreate is a no-op: we only police mutations on already-adopted
 // Deployments, and creation is the moment before adoption.
@@ -79,9 +106,20 @@ func (v *DeploymentCustomValidator) ValidateCreate(_ context.Context, _ *appsv1.
 // other change (image, env, resources, replicas going down) passes
 // straight through; the operator will reconcile against the new spec on
 // its own schedule.
-func (v *DeploymentCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj *appsv1.Deployment) (admission.Warnings, error) {
+//
+// The operator's own restore writes (S9 finalizer chain) are admitted
+// regardless of the replica delta: identifying them by UserInfo is the
+// only way to distinguish a legitimate restore from a user trying to
+// undo the quiesce by hand.
+func (v *DeploymentCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj *appsv1.Deployment) (admission.Warnings, error) {
 	if !hasAutopilotLabel(newObj) {
 		return nil, nil
+	}
+	if v.ControllerUsername != "" {
+		if req, err := admission.RequestFromContext(ctx); err == nil &&
+			req.UserInfo.Username == v.ControllerUsername {
+			return nil, nil
+		}
 	}
 	oldR := replicas(oldObj)
 	newR := replicas(newObj)

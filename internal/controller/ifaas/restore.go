@@ -38,6 +38,17 @@ package ifaas
 //     still serving traffic would re-introduce the very dual-writer problem
 //     the operator was built to prevent.
 //
+// As part of the second phase the adoption-trigger label
+// (ifaas.ifbiu.com/knative-autopilot) is also stripped from the Deployment.
+// That label is what causes the DeploymentWatcher to materialise a CR in the
+// first place; if we left it in place after release, the watcher would see
+// "labelled Deployment without a CR" the instant the apiserver finishes GC and
+// would immediately recreate the very CR the user just deleted, undoing the
+// entire teardown. Treating the label as a one-shot trigger that is consumed
+// by release gives `kubectl delete knativeadoption` a clean, idempotent
+// "release adoption" semantics — to re-adopt the workload the user re-applies
+// the label.
+//
 // Every step is idempotent: each Reconcile pass advances the teardown by at
 // most one finalizer, and a partial restore is detectable by inspecting which
 // finalizers are still present.
@@ -144,10 +155,10 @@ func (r *KnativeAdoptionReconciler) handleDeletion(ctx context.Context, a *ifaas
 
 	if controllerutil.ContainsFinalizer(a, FinalizerRestoreSource) {
 		setReady(a, metav1.ConditionFalse, ReasonRestoringSource, "restoring source Deployment replicas")
-		if err := r.restoreDeploymentReplicas(ctx, a); err != nil {
+		if err := r.restoreDeploymentSpec(ctx, a); err != nil {
 			setCondition(a, ifaasv1alpha1.ConditionDegraded, metav1.ConditionTrue, ReasonRestoreFailed, err.Error())
 			r.emitDual(ctx, a, eventTypeWarning, EventReasonRestoreFailed,
-				fmt.Sprintf("restore replicas: %v", err))
+				fmt.Sprintf("release source: %v", err))
 			return ctrl.Result{}, err
 		}
 		if err := r.removeFinalizer(ctx, a, FinalizerRestoreSource); err != nil {
@@ -248,13 +259,27 @@ func (r *KnativeAdoptionReconciler) rebuildSnapshotService(ctx context.Context, 
 	return nil
 }
 
-// restoreDeploymentReplicas writes the snapshotted replica count back onto
-// the source Deployment. A missing Deployment (the user deleted the workload
-// independently of releasing the adoption) is treated as a clean release —
-// there is nothing to restore. A no-op return is also given when the
-// Deployment is already at the target value, so repeated reconciles do not
-// generate spurious patches.
-func (r *KnativeAdoptionReconciler) restoreDeploymentReplicas(ctx context.Context, a *ifaasv1alpha1.KnativeAdoption) error {
+// restoreDeploymentSpec writes the snapshotted replica count back onto the
+// source Deployment and strips the adoption-trigger label
+// (ifaas.ifbiu.com/knative-autopilot) in the same MergeFrom patch.
+//
+// Both edits travel together for a reason: this is the last apiserver write
+// the deletion path performs before removing the final finalizer, after which
+// the apiserver physically deletes the CR. Once the CR is gone the
+// DeploymentWatcher would see a still-labelled Deployment without a backing
+// CR and immediately re-materialise one — undoing the entire release. By
+// having the label disappear in the very same patch that restores replicas
+// we guarantee that the next watcher reconcile observes "no label, no CR"
+// and stays out of the way. Re-adopting the workload requires the user to
+// re-apply the label, which is exactly the contract advertised at the top of
+// this file.
+//
+// A missing Deployment (the user deleted the workload independently of
+// releasing the adoption) is treated as a clean release — there is nothing to
+// restore. A no-op return is also given when the Deployment is already at
+// the target replica count and no longer carries the adoption label, so
+// repeated reconciles do not generate spurious patches.
+func (r *KnativeAdoptionReconciler) restoreDeploymentSpec(ctx context.Context, a *ifaasv1alpha1.KnativeAdoption) error {
 	if a.Status.SourceSnapshot == nil || a.Status.SourceSnapshot.Replicas == nil {
 		return nil
 	}
@@ -267,13 +292,18 @@ func (r *KnativeAdoptionReconciler) restoreDeploymentReplicas(ctx context.Contex
 		return err
 	}
 	target := *a.Status.SourceSnapshot.Replicas
-	if dep.Spec.Replicas != nil && *dep.Spec.Replicas == target {
+	replicasCorrect := dep.Spec.Replicas != nil && *dep.Spec.Replicas == target
+	_, hasTriggerLabel := dep.Labels[LabelEnabled]
+	if replicasCorrect && !hasTriggerLabel {
 		return nil
 	}
 	patch := client.MergeFrom(dep.DeepCopy())
 	dep.Spec.Replicas = &target
+	if hasTriggerLabel {
+		delete(dep.Labels, LabelEnabled)
+	}
 	if err := r.Patch(ctx, dep, patch); err != nil {
-		return fmt.Errorf("restore replicas: %w", err)
+		return fmt.Errorf("release source: %w", err)
 	}
 	return nil
 }

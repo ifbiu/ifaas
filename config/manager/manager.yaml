@@ -66,6 +66,14 @@ spec:
         image: controller:latest
         imagePullPolicy: IfNotPresent
         name: manager
+        env:
+        # Pin the operator's own apiserver username so its Deployment
+        # validating webhook can recognise S9 restore writes (0→>=1) and
+        # let them bypass the manual-scale-up ban. Must match
+        # `system:serviceaccount:<ns>:<sa-name>` produced by kustomize;
+        # if you change either prefix, override this value too.
+        - name: IFAAS_CONTROLLER_USERNAME
+          value: "system:serviceaccount:ifaas-system:ifaas-controller-manager"
         ports:
         - containerPort: 8081
           name: health

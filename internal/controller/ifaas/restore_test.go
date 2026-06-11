@@ -82,9 +82,11 @@ var _ = Describe("KnativeAdoption Restore (S9)", func() {
 		})
 
 		It("rebuilds the original Service and restores Deployment replicas when the CR is deleted", func() {
-			By("seeding a pre-existing Deployment+Service the operator will adopt")
+			By("seeding a pre-existing Deployment+Service the operator will adopt (Deployment carries the autopilot trigger label)")
 			origSvc := makeServiceForRestore(name, ns)
-			Expect(k8sClient.Create(ictx, makeDeployment(name, ns, 4))).To(Succeed())
+			seedDep := makeDeployment(name, ns, 4)
+			seedDep.Labels = map[string]string{LabelEnabled: LabelEnabledValue}
+			Expect(k8sClient.Create(ictx, seedDep)).To(Succeed())
 			Expect(k8sClient.Create(ictx, origSvc)).To(Succeed())
 			Expect(k8sClient.Create(ictx, makeAdoption(name, ns))).To(Succeed())
 
@@ -138,11 +140,13 @@ var _ = Describe("KnativeAdoption Restore (S9)", func() {
 			Expect(rebuilt.Spec.Ports[0].Port).To(Equal(int32(80)))
 			Expect(rebuilt.Annotations[AnnoServiceManagedBy]).To(Equal(AnnoServiceManagedByValue))
 
-			By("the source Deployment is back at its original replica count")
+			By("the source Deployment is back at its original replica count and the autopilot trigger label has been consumed")
 			dep := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ictx, types.NamespacedName{Namespace: ns, Name: name}, dep)).To(Succeed())
 			Expect(dep.Spec.Replicas).NotTo(BeNil())
 			Expect(*dep.Spec.Replicas).To(Equal(int32(4)))
+			Expect(dep.Labels).NotTo(HaveKey(LabelEnabled),
+				"finalizer must strip the adoption-trigger label so DeploymentWatcher does not re-materialise the CR after physical deletion")
 		})
 	})
 
@@ -159,7 +163,11 @@ var _ = Describe("KnativeAdoption Restore (S9)", func() {
 			By("constructing an adoption that has already finished phase A (service rebuilt, svc finalizer dropped)")
 			r := int32(2)
 			Expect(k8sClient.Create(ictx, &appsv1.Deployment{
-				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: ns,
+					Labels:    map[string]string{LabelEnabled: LabelEnabledValue},
+				},
 				Spec: appsv1.DeploymentSpec{
 					Replicas: ptrInt32(0),
 					Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
@@ -204,6 +212,8 @@ var _ = Describe("KnativeAdoption Restore (S9)", func() {
 			dep := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ictx, types.NamespacedName{Namespace: ns, Name: name}, dep)).To(Succeed())
 			Expect(*dep.Spec.Replicas).To(Equal(int32(2)))
+			Expect(dep.Labels).NotTo(HaveKey(LabelEnabled),
+				"phase B must consume the autopilot trigger label even when phase A has already finished")
 		})
 	})
 
