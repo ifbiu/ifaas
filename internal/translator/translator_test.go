@@ -24,7 +24,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 
 	ifaasv1alpha1 "github.com/ifbiu/ifaas/api/ifaas/v1alpha1"
 )
@@ -124,9 +123,15 @@ func TestTranslate_HappyPath_SingleContainer(t *testing.T) {
 	}
 }
 
-// --- preStop injection --------------------------------------------------
+// --- M1 omits PreStop / TerminationGracePeriodSeconds ---------------------
+//
+// Stock Knative does not declare these PodSpec fields in its KSvc CRD
+// schema; SSA rejects the patch with "field not declared in schema" unless
+// the operator at the cluster level enables the corresponding feature
+// gates. Translator therefore ships them empty in M1, and the gate-aware
+// opt-in surface is left for a follow-up (see plan §12).
 
-func TestTranslate_PreStopInjected(t *testing.T) {
+func TestTranslate_NoPreStopInjectedByDefault(t *testing.T) {
 	dep := newDeployment("hello", "default", []corev1.Container{basicContainer("app", 8080)})
 	a := newAdoption("hello", "default")
 
@@ -134,19 +139,12 @@ func TestTranslate_PreStopInjected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	c := ksvc.Spec.Template.Spec.Containers[0]
-	if c.Lifecycle == nil || c.Lifecycle.PreStop == nil || c.Lifecycle.PreStop.HTTPGet == nil {
-		t.Fatalf("preStop httpGet not injected: %#v", c.Lifecycle)
-	}
-	if c.Lifecycle.PreStop.HTTPGet.Path != "/scaledownz" {
-		t.Errorf("preStop path mismatch: %s", c.Lifecycle.PreStop.HTTPGet.Path)
-	}
-	if got := c.Lifecycle.PreStop.HTTPGet.Port; got != intstr.FromInt32(8080) {
-		t.Errorf("preStop port mismatch: %v", got)
+	if c := ksvc.Spec.Template.Spec.Containers[0]; c.Lifecycle != nil {
+		t.Fatalf("M1 must not write Lifecycle: %#v", c.Lifecycle)
 	}
 }
 
-func TestTranslate_PreStopOverridesUserLifecycle(t *testing.T) {
+func TestTranslate_PreservesUserAuthoredLifecycle(t *testing.T) {
 	cs := basicContainer("app", 8080)
 	cs.Lifecycle = &corev1.Lifecycle{
 		PostStart: &corev1.LifecycleHandler{Exec: &corev1.ExecAction{Command: []string{"echo"}}},
@@ -160,63 +158,26 @@ func TestTranslate_PreStopOverridesUserLifecycle(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	c := ksvc.Spec.Template.Spec.Containers[0]
-	if c.Lifecycle.PostStart == nil || c.Lifecycle.PostStart.Exec == nil {
-		t.Errorf("postStart should be preserved: %#v", c.Lifecycle.PostStart)
+	if c.Lifecycle == nil || c.Lifecycle.PostStart == nil || c.Lifecycle.PostStart.Exec == nil {
+		t.Errorf("user PostStart should be preserved verbatim: %#v", c.Lifecycle)
 	}
-	if c.Lifecycle.PreStop.HTTPGet == nil || c.Lifecycle.PreStop.Exec != nil {
-		t.Errorf("preStop should be overridden to httpGet: %#v", c.Lifecycle.PreStop)
+	if c.Lifecycle.PreStop == nil || c.Lifecycle.PreStop.Exec == nil {
+		t.Errorf("user PreStop should be preserved verbatim: %#v", c.Lifecycle.PreStop)
 	}
 }
 
-func TestTranslate_ProbePortAndPathOverride(t *testing.T) {
-	dep := newDeployment("hello", "default", []corev1.Container{basicContainer("app", 8080)})
-	a := newAdoption("hello", "default", func(a *ifaasv1alpha1.KnativeAdoption) {
-		a.Spec.ScaleDownProbe.Port = ptrInt32(9999)
-		a.Spec.ScaleDownProbe.Path = "/custom-z"
+func TestTranslate_NoTerminationGracePeriodSet(t *testing.T) {
+	dep := newDeployment("hello", "default", []corev1.Container{basicContainer("app", 8080)}, func(d *appsv1.Deployment) {
+		d.Spec.Template.Spec.TerminationGracePeriodSeconds = ptrInt64(120)
 	})
+	a := newAdoption("hello", "default")
+
 	ksvc, err := Translate(dep, a)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	p := ksvc.Spec.Template.Spec.Containers[0].Lifecycle.PreStop.HTTPGet
-	if p.Path != "/custom-z" || p.Port != intstr.FromInt32(9999) {
-		t.Errorf("probe override not honoured: path=%s port=%v", p.Path, p.Port)
-	}
-}
-
-// --- termination grace period ------------------------------------------
-
-func TestTranslate_TerminationGracePeriodMax(t *testing.T) {
-	tests := []struct {
-		name      string
-		depGrace  *int64
-		interval  int32
-		threshold int32
-		want      int64
-	}{
-		{"defaults", nil, 0, 0, 30*20 + 5},
-		{"user origin beats calc", ptrInt64(9999), 30, 20, 9999},
-		{"calc beats user origin", ptrInt64(10), 30, 20, 30*20 + 5},
-		{"custom interval+threshold", nil, 10, 6, 10*6 + 5},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			dep := newDeployment("hello", "default", []corev1.Container{basicContainer("app", 8080)}, func(d *appsv1.Deployment) {
-				d.Spec.Template.Spec.TerminationGracePeriodSeconds = tt.depGrace
-			})
-			a := newAdoption("hello", "default", func(a *ifaasv1alpha1.KnativeAdoption) {
-				a.Spec.ScaleDownProbe.IntervalSeconds = tt.interval
-				a.Spec.ScaleDownProbe.ConsecutiveFailureThreshold = tt.threshold
-			})
-			ksvc, err := Translate(dep, a)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			got := ksvc.Spec.Template.Spec.TerminationGracePeriodSeconds
-			if got == nil || *got != tt.want {
-				t.Errorf("grace period want=%d got=%v", tt.want, got)
-			}
-		})
+	if got := ksvc.Spec.Template.Spec.TerminationGracePeriodSeconds; got != nil {
+		t.Fatalf("M1 must leave TerminationGracePeriodSeconds unset, got %d", *got)
 	}
 }
 
@@ -313,6 +274,42 @@ func TestTranslate_PortRejection(t *testing.T) {
 				t.Fatalf("want %v, got %v", tt.wantErr, err)
 			}
 		})
+	}
+}
+
+// Knative serving validates the revision template's container ports
+// against a closed name set ("", "h2c", "http1") and rejects arbitrary
+// user names like "http". Translator must scrub Name rather than
+// faithfully copying user input — otherwise the KSvc never lands.
+// HostPort is rejected upstream by validatePodSpec, so it never reaches
+// the sanitiser; HostIP is silently cleared as a defensive nicety.
+func TestTranslate_PortSanitisation(t *testing.T) {
+	c := basicContainer("app", 8080)
+	c.Ports = []corev1.ContainerPort{{
+		Name:          "http",
+		ContainerPort: 8080,
+		HostIP:        "127.0.0.1",
+		Protocol:      corev1.ProtocolTCP,
+	}}
+	dep := newDeployment("hello", "default", []corev1.Container{c})
+	a := newAdoption("hello", "default")
+
+	ksvc, err := Translate(dep, a)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := ksvc.Spec.Template.Spec.Containers[0].Ports
+	if len(got) != 1 {
+		t.Fatalf("want 1 port, got %d", len(got))
+	}
+	if got[0].Name != "" {
+		t.Fatalf("port name must be cleared, got %q", got[0].Name)
+	}
+	if got[0].HostIP != "" {
+		t.Fatalf("HostIP must be cleared, got %q", got[0].HostIP)
+	}
+	if got[0].ContainerPort != 8080 {
+		t.Fatalf("ContainerPort must survive, got %d", got[0].ContainerPort)
 	}
 }
 

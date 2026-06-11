@@ -24,7 +24,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	ifaasv1alpha1 "github.com/ifbiu/ifaas/api/ifaas/v1alpha1"
@@ -155,22 +154,6 @@ func (r *KnativeAdoptionReconciler) snapshotAndDeleteService(ctx context.Context
 	}
 	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete pre-existing service: %w", err)
-	}
-	return nil
-}
-
-// ensureRestoreFinalizer guarantees the restore-source-service finalizer is
-// present so a deletion of the CR cannot race past the service-rebuild step
-// scheduled in S9. The finalizer is added once and never removed by S5; the
-// teardown path owns the removal contract.
-func (r *KnativeAdoptionReconciler) ensureRestoreFinalizer(ctx context.Context, adoption *ifaasv1alpha1.KnativeAdoption) error {
-	if controllerHasFinalizer(adoption, FinalizerRestoreSourceService) {
-		return nil
-	}
-	patch := client.MergeFrom(adoption.DeepCopy())
-	adoption.Finalizers = append(adoption.Finalizers, FinalizerRestoreSourceService)
-	if err := r.Patch(ctx, adoption, patch); err != nil {
-		return fmt.Errorf("add finalizer: %w", err)
 	}
 	return nil
 }

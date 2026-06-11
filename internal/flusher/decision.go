@@ -142,6 +142,12 @@ type Config struct {
 	// real wall clock; tests inject a fake clock to drive timers
 	// deterministically.
 	Clock Clock
+
+	// Observer receives queue-depth / inflight / flush-result transitions
+	// for metrics emission. Leave nil to disable observation; the Manager
+	// substitutes a nopObserver so internal call sites stay
+	// nil-check-free.
+	Observer Observer
 }
 
 // withDefaults returns a copy of c with zero-valued fields populated by the
@@ -165,6 +171,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Clock == nil {
 		c.Clock = realClock{}
+	}
+	if c.Observer == nil {
+		c.Observer = nopObserver{}
 	}
 	return c
 }

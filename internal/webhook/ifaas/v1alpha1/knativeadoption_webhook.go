@@ -137,6 +137,18 @@ func (v *KnativeAdoptionCustomValidator) ValidateUpdate(ctx context.Context, old
 	if oldObj.Spec.SourceRef != newObj.Spec.SourceRef {
 		return nil, fmt.Errorf("spec.sourceRef is immutable: %+v → %+v", oldObj.Spec.SourceRef, newObj.Spec.SourceRef)
 	}
+	// Once the CR enters deletion, the operator's finalizer chain (S9)
+	// issues spec-preserving Update calls to peel off its own finalizers
+	// after restoring source state. By that point the source Deployment
+	// may legitimately be gone (e.g. namespace-cascade delete, or
+	// user-initiated cleanup that triggered the adoption to unwind).
+	// Re-running validateSpec against post-restore state would re-fail
+	// checkSourceExists / checkNoHPA and trap the CR in a webhook-vs-
+	// finalizer deadlock. Immutability of sourceRef is still enforced
+	// above, so this short-circuit only loosens the live-state checks.
+	if newObj.DeletionTimestamp != nil {
+		return nil, nil
+	}
 	return nil, v.validateSpec(ctx, newObj)
 }
 

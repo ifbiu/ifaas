@@ -1,3 +1,15 @@
 resources:
 - manifests.yaml
 - service.yaml
+
+# JSON-patch to scope vdeployment-v1.kb.io to autopilot-labeled objects only.
+# See patches/deployment_webhook_object_selector.yaml for the rationale; the
+# patch index 0 below points at the first webhook entry of
+# ValidatingWebhookConfiguration in manifests.yaml, which is vdeployment-v1.kb.io.
+patches:
+- path: patches/deployment_webhook_object_selector.yaml
+  target:
+    group: admissionregistration.k8s.io
+    version: v1
+    kind: ValidatingWebhookConfiguration
+    name: validating-webhook-configuration

@@ -63,36 +63,74 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
-# TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
-# The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
-# kubectl kuberc is disabled by default for test isolation; enable with:
-# - KUBECTL_KUBERC=true
-# CertManager is installed by default; skip with:
-# - CERT_MANAGER_INSTALL_SKIP=true
-KIND_CLUSTER ?= ifaas-test-e2e
+# E2E runtime knobs:
+# - E2E_RUNTIME=k3s   (default) assumes a pre-existing k3s cluster with Knative Serving/Eventing
+#                     and cert-manager installed. Image is loaded into k3s containerd via `k3s ctr`.
+# - E2E_RUNTIME=kind  legacy path: spins up a kind cluster and `kind load` the image.
+# - E2E_RUNTIME=external skips any cluster/image setup; assumes ifaas already deployed.
+E2E_RUNTIME      ?= k3s
+KIND_CLUSTER     ?= ifaas-test-e2e
+K3S_CTR          ?= sudo k3s ctr
+E2E_IMG          ?= ifaas:e2e
+E2E_STUB_IMG     ?= ifaas-scaledownz-stub:e2e
+E2E_NAMESPACE    ?= ifaas-e2e
 
 .PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
-	@command -v $(KIND) >/dev/null 2>&1 || { \
-		echo "Kind is not installed. Please install Kind manually."; \
-		exit 1; \
-	}
-	@case "$$($(KIND) get clusters)" in \
-		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
-		*) \
-			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
+setup-test-e2e: ## Prepare cluster + images for e2e according to E2E_RUNTIME.
+	@case "$(E2E_RUNTIME)" in \
+		kind) \
+			command -v $(KIND) >/dev/null 2>&1 || { echo "kind not installed"; exit 1; }; \
+			case "$$($(KIND) get clusters)" in *"$(KIND_CLUSTER)"*) echo "kind cluster ready";; \
+			*) $(KIND) create cluster --name $(KIND_CLUSTER);; esac; \
+			$(MAKE) docker-build IMG=$(E2E_IMG); \
+			$(MAKE) stub-build  IMG=$(E2E_STUB_IMG); \
+			$(KIND) load docker-image $(E2E_IMG)      --name $(KIND_CLUSTER); \
+			$(KIND) load docker-image $(E2E_STUB_IMG) --name $(KIND_CLUSTER) ;; \
+		k3s) \
+			$(MAKE) docker-build IMG=$(E2E_IMG); \
+			$(MAKE) stub-build   IMG=$(E2E_STUB_IMG); \
+			$(MAKE) k3s-load     IMG=$(E2E_IMG); \
+			$(MAKE) k3s-load     IMG=$(E2E_STUB_IMG) ;; \
+		external) \
+			echo "E2E_RUNTIME=external: rebuilding ifaas controller image; stub left to user"; \
+			$(MAKE) docker-build IMG=$(E2E_IMG); \
+			$(MAKE) k3s-load     IMG=$(E2E_IMG) ;; \
+		*) echo "unknown E2E_RUNTIME=$(E2E_RUNTIME)"; exit 1 ;; \
 	esac
+	$(MAKE) install
+	$(MAKE) deploy IMG=$(E2E_IMG)
+	@if [ "$(E2E_RUNTIME)" = "external" ] || [ "$(E2E_RUNTIME)" = "k3s" ]; then \
+		echo "force-rolling controller-manager so the new image is picked up (same tag, IfNotPresent)"; \
+		"$(KUBECTL)" -n ifaas-system rollout restart deploy/ifaas-controller-manager; \
+	fi
+	"$(KUBECTL)" -n ifaas-system rollout status deploy/ifaas-controller-manager --timeout=180s
+
+.PHONY: stub-build
+stub-build: ## Build the e2e workload stub image (scaledownz probe + business port).
+	CGO_ENABLED=0 GOOS=linux go build -o test/e2e/stub/scaledownz-stub ./test/e2e/stub
+	$(CONTAINER_TOOL) build -f test/e2e/stub/Dockerfile -t $(IMG) test/e2e/stub
+	rm -f test/e2e/stub/scaledownz-stub
+
+.PHONY: k3s-load
+k3s-load: ## Import IMG into k3s built-in containerd (namespace k8s.io).
+	@command -v docker >/dev/null 2>&1 || { echo "docker not installed"; exit 1; }
+	@tmp=$$(mktemp -t ifaas-img-XXXX.tar); \
+		docker save "$(IMG)" -o "$$tmp"; \
+		$(K3S_CTR) -n k8s.io images import "$$tmp"; \
+		rm -f "$$tmp"
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
-	$(MAKE) cleanup-test-e2e
+test-e2e: manifests generate fmt vet setup-test-e2e ## Run the e2e tests against a real cluster.
+	E2E_RUNTIME=$(E2E_RUNTIME) E2E_NAMESPACE=$(E2E_NAMESPACE) E2E_IMG=$(E2E_IMG) E2E_STUB_IMG=$(E2E_STUB_IMG) \
+		go test -tags=e2e ./test/e2e/... -v -ginkgo.v -timeout=20m
+	@echo "[hint] run 'make cleanup-test-e2e' to drop the e2e namespace and ifaas deployment"
 
 .PHONY: cleanup-test-e2e
-cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+cleanup-test-e2e: ## Tear down e2e leftovers (namespace + ifaas deploy). kind cluster is also removed when E2E_RUNTIME=kind.
+	-"$(KUBECTL)" delete ns $(E2E_NAMESPACE) --ignore-not-found --wait=false
+	-$(MAKE) undeploy ignore-not-found=true
+	-$(MAKE) uninstall ignore-not-found=true
+	@if [ "$(E2E_RUNTIME)" = "kind" ]; then $(KIND) delete cluster --name $(KIND_CLUSTER); fi
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter

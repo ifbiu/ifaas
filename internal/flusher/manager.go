@@ -114,7 +114,7 @@ func (m *Manager) Enqueue(d Decision) error {
 	}
 	lane := m.lanes[d.Namespace]
 	if lane == nil {
-		lane = m.newLane()
+		lane = m.newLane(d.Namespace)
 		m.lanes[d.Namespace] = lane
 	}
 	m.mu.Unlock()
@@ -123,29 +123,33 @@ func (m *Manager) Enqueue(d Decision) error {
 	return nil
 }
 
-func (m *Manager) newLane() *nsLane {
+func (m *Manager) newLane(namespace string) *nsLane {
 	cap := m.cfg.MaxInFlight
 	var sem chan struct{}
 	if cap > 0 {
 		sem = make(chan struct{}, cap)
 	}
 	return &nsLane{
-		mgr:      m,
-		pending:  make(map[Key]Decision),
-		failures: make(map[Key]int),
-		sem:      sem,
+		mgr:       m,
+		namespace: namespace,
+		pending:   make(map[Key]Decision),
+		failures:  make(map[Key]int),
+		sem:       sem,
 	}
 }
 
 // nsLane holds the per-namespace state of the Manager. All fields except the
-// channel-based `sem` are protected by `mu`.
+// channel-based `sem` are protected by `mu`. `namespace` is set at
+// construction and never mutated.
 type nsLane struct {
-	mgr *Manager
+	mgr       *Manager
+	namespace string
 
 	mu       sync.Mutex
 	pending  map[Key]Decision
 	failures map[Key]int
 	timer    Timer
+	inflight int
 
 	sem chan struct{}
 }
@@ -166,6 +170,7 @@ func (l *nsLane) enqueue(d Decision) {
 		// the lane is empty after a flush.
 		batch := l.drainLocked()
 		l.mu.Unlock()
+		l.mgr.cfg.Observer.QueueDepth(l.namespace, 0)
 		l.dispatch(batch)
 		return
 	}
@@ -176,7 +181,9 @@ func (l *nsLane) enqueue(d Decision) {
 	if l.timer == nil {
 		l.timer = l.mgr.cfg.Clock.AfterFunc(l.mgr.cfg.DebounceWindow, l.flushSlow)
 	}
+	depth := len(l.pending)
 	l.mu.Unlock()
+	l.mgr.cfg.Observer.QueueDepth(l.namespace, depth)
 }
 
 // drainLocked snapshots and clears the pending map and stops the debounce
@@ -203,6 +210,7 @@ func (l *nsLane) flushSlow() {
 	l.mu.Lock()
 	batch := l.drainLocked()
 	l.mu.Unlock()
+	l.mgr.cfg.Observer.QueueDepth(l.namespace, 0)
 	l.dispatch(batch)
 }
 
@@ -240,17 +248,30 @@ func (l *nsLane) runOne(d Decision) {
 		defer func() { <-l.sem }()
 	}
 
+	l.mu.Lock()
+	l.inflight++
+	curIn := l.inflight
+	l.mu.Unlock()
+	l.mgr.cfg.Observer.PatchInflight(l.namespace, curIn)
+
 	skipped, err := l.mgr.patcher.Patch(l.mgr.ctx, d)
 
 	l.mu.Lock()
+	l.inflight--
+	curOut := l.inflight
 	switch {
 	case err == nil:
 		// Success or apiserver-state-already-equal: reset the per-key
 		// failure counter so a future intermittent error does not
 		// instantly cross the threshold.
 		delete(l.failures, d.Key())
-		_ = skipped
 		l.mu.Unlock()
+		l.mgr.cfg.Observer.PatchInflight(l.namespace, curOut)
+		if skipped {
+			l.mgr.cfg.Observer.FlushResult(l.namespace, ResultSkipped)
+		} else {
+			l.mgr.cfg.Observer.FlushResult(l.namespace, ResultSuccess)
+		}
 		if l.mgr.onResult != nil {
 			l.mgr.onResult(d.Key(), nil, 0)
 		}
@@ -259,6 +280,8 @@ func (l *nsLane) runOne(d Decision) {
 		count := l.failures[d.Key()]
 		threshold := l.mgr.cfg.MaxFailures
 		l.mu.Unlock()
+		l.mgr.cfg.Observer.PatchInflight(l.namespace, curOut)
+		l.mgr.cfg.Observer.FlushResult(l.namespace, ResultFailed)
 		if l.mgr.onResult != nil {
 			l.mgr.onResult(d.Key(), err, count)
 		}

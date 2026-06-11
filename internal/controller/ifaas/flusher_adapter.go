@@ -23,12 +23,15 @@ import (
 	"strconv"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	kservingv1 "knative.dev/serving/pkg/apis/serving/v1"
 
+	ifaasv1alpha1 "github.com/ifbiu/ifaas/api/ifaas/v1alpha1"
 	"github.com/ifbiu/ifaas/internal/flusher"
 	"github.com/ifbiu/ifaas/internal/translator"
 )
@@ -105,25 +108,47 @@ func buildMinScaleMergePatch(annotationKey, value string) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
-// NewLogOnlyFailureSink returns a flusher.FailureSink that only logs once a
-// decision crosses the consecutive-failure threshold.
+// NewFlusherFailureSink returns a flusher.FailureSink that surfaces the
+// guard-flush failure on the originating KnativeAdoption:
 //
-// Rationale (S7 → S10 hand-off):
-//   - Writing ConditionDegraded and recording an Event from the flusher
-//     would force this module to depend on the v1alpha1 API and on the
-//     event recorder, undoing the package boundary.
-//   - S10 owns the full Conditions catalogue and metrics emission. The
-//     reconciler will surface guard-flush failures there using
-//     `status.lastScaleDownProbe.consecutiveErrors`, which the guard
-//     already maintains.
+//   - Conditions[Degraded]=True with reason GuardFlushFailed and the
+//     consecutive-attempt count + last error in the message.
+//   - A Warning Event mirrored on the CR and (best-effort) the source
+//     Deployment.
+//   - The error is also logged so the failure stays observable when the CR
+//     has already been deleted between the flush and the sink.
 //
-// Until S10 lands, a log-only sink is enough: production failures still
-// show up in operator logs, and tests use a custom sink.
-func NewLogOnlyFailureSink() flusher.FailureSink {
+// The sink only fires once a Decision crosses the consecutive-failure
+// threshold (configured on flusher.Config.MaxFailures); per-attempt
+// failures are accounted for by metrics.GuardFlushTotal{result="failed"}
+// via the Observer.
+func NewFlusherFailureSink(c client.Client, recorder record.EventRecorder) flusher.FailureSink {
 	return func(ctx context.Context, d flusher.Decision, attempts int, lastErr error) {
 		log := logf.FromContext(ctx).WithName("flusher").
 			WithValues("namespace", d.Namespace, "ksvc", d.KSvcName, "adoption", d.AdoptionName)
 		log.Error(lastErr, "flusher: consecutive patch failures crossed threshold",
 			"attempts", attempts, "desiredMinScale", d.DesiredMinScale, "reason", d.Reason)
+
+		// Best-effort: write Degraded + Event on the originating CR.
+		// A missing CR (release path raced with the sink) is silently
+		// dropped because the desired observable end-state has already
+		// been reached.
+		a := &ifaasv1alpha1.KnativeAdoption{}
+		err := c.Get(ctx, types.NamespacedName{Namespace: d.Namespace, Name: d.AdoptionName}, a)
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		if err != nil {
+			log.Error(err, "flusher sink: get adoption")
+			return
+		}
+		msg := fmt.Sprintf("guard flush failed %d times in a row: %v", attempts, lastErr)
+		patch := client.MergeFrom(a.DeepCopy())
+		setCondition(a, ifaasv1alpha1.ConditionDegraded, metav1.ConditionTrue, ReasonScaleDownProbeError, msg)
+		_ = c.Status().Patch(ctx, a, patch)
+
+		if recorder != nil {
+			recorder.Event(a, "Warning", EventReasonGuardFlushFail, msg)
+		}
 	}
 }

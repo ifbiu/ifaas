@@ -18,6 +18,7 @@ package ifaas
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,6 +42,7 @@ import (
 
 	ifaasv1alpha1 "github.com/ifbiu/ifaas/api/ifaas/v1alpha1"
 	"github.com/ifbiu/ifaas/internal/flusher"
+	"github.com/ifbiu/ifaas/internal/metrics"
 	"github.com/ifbiu/ifaas/internal/scaledown"
 	"github.com/ifbiu/ifaas/internal/translator"
 )
@@ -80,6 +83,13 @@ type KnativeAdoptionReconciler struct {
 	// to drive only structural changes; either way the apiserver lands the
 	// same desired value, so the two paths are observably equivalent.
 	Flusher FlusherEnqueuer
+
+	// Recorder emits Kubernetes Events on every observable transition
+	// (adoption complete, refusal, guard verdict, restore failure, …).
+	// Leave nil to disable event emission entirely; the helpers in
+	// events.go nil-check before each call so there is no behavioural
+	// difference beyond the missing audit trail.
+	Recorder record.EventRecorder
 }
 
 // FlusherEnqueuer is the subset of *flusher.Manager the reconciler needs. It
@@ -98,6 +108,7 @@ type FlusherEnqueuer interface {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;delete;create
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/proxy,verbs=get
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile implements the adoption pipeline described in
 // docs/knative-autopilot-impl-plan.md §S3.
@@ -115,25 +126,42 @@ func (r *KnativeAdoptionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// Snapshot so we can write status with a single patch at the end.
 	original := adoption.DeepCopy()
 
-	// S5: ensure the restore-source-service finalizer is present before we
-	// touch any external state. Status patches happen at the end of Reconcile,
-	// but this is a spec-level mutation so we apply it now via its own patch.
-	if adoption.DeletionTimestamp.IsZero() {
-		if err := r.ensureRestoreFinalizer(ctx, &adoption); err != nil {
-			return ctrl.Result{}, err
+	// Deletion path (S9): hand the CR to the restore reconciler. It owns
+	// the teardown order — Service rebuild → service-finalizer removal →
+	// Deployment replicas restore → source-finalizer removal — and is
+	// idempotent across requeues, so we can leave the rest of the
+	// adoption pipeline out of this branch entirely.
+	if !adoption.DeletionTimestamp.IsZero() {
+		res, err := r.handleDeletion(ctx, &adoption)
+		if statusErr := r.patchStatus(ctx, original, &adoption); statusErr != nil && !apierrors.IsNotFound(statusErr) {
+			log.Error(statusErr, "failed to patch status during deletion")
+			if err == nil {
+				err = statusErr
+			}
 		}
-		// Re-snapshot after the finalizer patch so the end-of-Reconcile status
-		// diff is computed against the latest spec.
-		original = adoption.DeepCopy()
-	} else {
-		// Deletion path is owned by S9. For now we let the controller idle
-		// while the CR awaits its restore-source-service finalizer; the
-		// teardown logic will be wired up there.
-		log.V(1).Info("adoption marked for deletion; skipping reconcile until S9 lands")
-		return ctrl.Result{}, nil
+		return res, err
 	}
 
+	// S5 + S9: stamp every finalizer the teardown path will need before we
+	// touch any external state. ensureFinalizers is idempotent and patches
+	// at most once per Reconcile pass.
+	if err := r.ensureFinalizers(ctx, &adoption); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Re-snapshot after the finalizer patch so the end-of-Reconcile status
+	// diff is computed against the latest spec.
+	original = adoption.DeepCopy()
+
 	res, reconcileErr := r.reconcileAdoption(ctx, &adoption)
+
+	// Aggregate Ready from the per-stage signals so callers that only watch
+	// status.conditions[type=Ready] see a consistent picture regardless of
+	// which branch wrote which sub-condition.
+	recomputeReady(&adoption)
+
+	// Audit-grade observability: detect Ready-edge transitions and stamp
+	// the per-CR revision-age gauge before the status diff lands.
+	r.observeAdoption(ctx, original, &adoption)
 
 	if statusErr := r.patchStatus(ctx, original, &adoption); statusErr != nil {
 		log.Error(statusErr, "failed to patch status")
@@ -176,6 +204,9 @@ func (r *KnativeAdoptionReconciler) reconcileAdoption(ctx context.Context, adopt
 		setCondition(adoption, ifaasv1alpha1.ConditionTranslationDegraded, metav1.ConditionTrue, ReasonTranslationFailed, err.Error())
 		setCondition(adoption, ifaasv1alpha1.ConditionAdopted, metav1.ConditionFalse, ReasonTranslationFailed, err.Error())
 		setReady(adoption, metav1.ConditionFalse, ReasonTranslationFailed, err.Error())
+		metrics.TranslationErrorsTotal.WithLabelValues(translationErrorReason(err)).Inc()
+		r.emitDual(ctx, adoption, eventTypeWarning, EventReasonAdoptionRefused,
+			fmt.Sprintf("translator refused: %v", err))
 		// translation errors are terminal until the user changes either the
 		// Deployment or the CR; do not requeue, rely on watches.
 		log.Info("translation refused", "err", err)
@@ -196,6 +227,8 @@ func (r *KnativeAdoptionReconciler) reconcileAdoption(ctx context.Context, adopt
 			ReasonServiceSwapTypeRefuse, "service adoption refused; KSvc not created")
 		setReady(adoption, metav1.ConditionFalse, ReasonServiceSwapTypeRefuse,
 			"service adoption refused")
+		r.emitDual(ctx, adoption, eventTypeWarning, EventReasonAdoptionRefused,
+			"same-name Service cannot be adopted; refusing")
 		return ctrl.Result{}, nil
 	}
 	if swap == SwapTakenOver {
@@ -478,4 +511,69 @@ func (r *KnativeAdoptionReconciler) mapServiceToAdoptions(ctx context.Context, o
 		return nil
 	}
 	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: a.Namespace, Name: a.Name}}}
+}
+
+// observeAdoption diffs Ready before/after this reconcile pass and emits the
+// AdoptedTotal counter + an Adopted Event when the CR transitions
+// non-Ready→Ready. The wall-clock revision-age gauge is re-stamped on every
+// pass that observes Adopted=True, so dashboards converge to the current age
+// even if the operator restarts.
+func (r *KnativeAdoptionReconciler) observeAdoption(ctx context.Context, prev, cur *ifaasv1alpha1.KnativeAdoption) {
+	prevReady := isReadyTrue(prev)
+	curReady := isReadyTrue(cur)
+	if !prevReady && curReady {
+		metrics.AdoptedTotal.WithLabelValues(cur.Namespace).Inc()
+		r.emitDual(ctx, cur, eventTypeNormal, EventReasonAdopted,
+			fmt.Sprintf("KnativeAdoption %s/%s is Ready", cur.Namespace, cur.Name))
+	}
+	if isCondTrue(cur, ifaasv1alpha1.ConditionAdopted) {
+		age := time.Since(cur.CreationTimestamp.Time).Seconds()
+		metrics.RevisionAgeSeconds.WithLabelValues(cur.Namespace, cur.Name).Set(age)
+	}
+}
+
+// isReadyTrue reads the aggregated Ready condition (written by
+// recomputeReady). It tolerates a nil pointer to simplify diff helpers.
+func isReadyTrue(a *ifaasv1alpha1.KnativeAdoption) bool {
+	if a == nil {
+		return false
+	}
+	return isCondTrue(a, ifaasv1alpha1.ConditionReady)
+}
+
+// isCondTrue is a nil-safe shorthand for "find the named condition and check
+// status==True". Returns false when either the CR or the condition is
+// absent.
+func isCondTrue(a *ifaasv1alpha1.KnativeAdoption, t string) bool {
+	if a == nil {
+		return false
+	}
+	c := apimeta.FindStatusCondition(a.Status.Conditions, t)
+	return c != nil && c.Status == metav1.ConditionTrue
+}
+
+// errorsIs is a thin wrapper so the file's helper definitions read like
+// switch-cases instead of repeated `errors.Is(...)` calls. Kept private to
+// the package to avoid leaking yet another error-comparison helper.
+func errorsIs(err, target error) bool { return errors.Is(err, target) }
+
+// translationErrorReason maps a translator sentinel error to the metrics
+// `reason` label. Unknown errors (i.e. wrapped third-party errors a future
+// translator change might surface) bucket into "other" so the cardinality
+// stays bounded.
+func translationErrorReason(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errorsIs(err, translator.ErrAmbiguousPrimary), errorsIs(err, translator.ErrPrimaryNotFound):
+		return metrics.TranslationReasonMultiContainer
+	case errorsIs(err, translator.ErrHostNetwork), errorsIs(err, translator.ErrHostPID), errorsIs(err, translator.ErrHostIPC):
+		return metrics.TranslationReasonHostNetwork
+	case errorsIs(err, translator.ErrHostPort):
+		return metrics.TranslationReasonHostPort
+	case errorsIs(err, translator.ErrNoContainer), errorsIs(err, translator.ErrNoContainerPort), errorsIs(err, translator.ErrUnsupportedProtocol):
+		return metrics.TranslationReasonInvalidProbe
+	default:
+		return metrics.TranslationReasonOther
+	}
 }

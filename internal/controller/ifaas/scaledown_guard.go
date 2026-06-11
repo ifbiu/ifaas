@@ -29,6 +29,7 @@ import (
 
 	ifaasv1alpha1 "github.com/ifbiu/ifaas/api/ifaas/v1alpha1"
 	"github.com/ifbiu/ifaas/internal/flusher"
+	"github.com/ifbiu/ifaas/internal/metrics"
 	"github.com/ifbiu/ifaas/internal/scaledown"
 )
 
@@ -110,6 +111,7 @@ func (r *KnativeAdoptionReconciler) runScaleDownGuard(ctx context.Context, adopt
 		setCondition(adoption, ifaasv1alpha1.ConditionScaleDownAllowed,
 			metav1.ConditionUnknown, ReasonScaleDownProbeError, err.Error())
 		maybeMarkDegraded(adoption, failureThreshold)
+		metrics.ScaleDownProbeErrorsTotal.WithLabelValues(metrics.ProbeErrorReasonListPods).Inc()
 		return scaledown.OutcomeBlock, interval
 	}
 
@@ -124,14 +126,26 @@ func (r *KnativeAdoptionReconciler) runScaleDownGuard(ctx context.Context, adopt
 
 	switch outcome {
 	case scaledown.OutcomeAllowZero:
+		prevAllowed := isCondTrue(adoption, ifaasv1alpha1.ConditionScaleDownAllowed)
 		setCondition(adoption, ifaasv1alpha1.ConditionScaleDownAllowed,
 			metav1.ConditionTrue, ReasonScaleDownAllowed, msg)
 		clearConditionIfReason(adoption, ifaasv1alpha1.ConditionDegraded, ReasonScaleDownProbeError)
 		r.enqueueMinScale(adoption, 0, "scaledownz=true")
+		if !prevAllowed {
+			r.emitEvent(adoption, eventTypeNormal, EventReasonScaleDownAllowed, msg)
+		}
 	case scaledown.OutcomeBlock:
+		prevBlocked := condReasonIs(adoption, ifaasv1alpha1.ConditionScaleDownAllowed, ReasonScaleDownBlocked)
 		setCondition(adoption, ifaasv1alpha1.ConditionScaleDownAllowed,
 			metav1.ConditionFalse, ReasonScaleDownBlocked, msg)
 		r.enqueueMinScale(adoption, 1, ReasonScaleDownBlocked)
+		metrics.ScaleDownBlockedTotal.WithLabelValues(adoption.Namespace, adoption.Name).Inc()
+		if errored > 0 {
+			metrics.ScaleDownProbeErrorsTotal.WithLabelValues(metrics.ProbeErrorReasonProberFault).Add(float64(errored))
+		}
+		if !prevBlocked {
+			r.emitEvent(adoption, eventTypeNormal, EventReasonScaleDownBlocked, msg)
+		}
 	case scaledown.OutcomeNoPods:
 		// All pods are already gone (e.g. KSvc has scaled to zero). The
 		// guard cannot assert anything; keep the previous condition value so
@@ -180,7 +194,9 @@ func (r *KnativeAdoptionReconciler) probeAll(ctx context.Context, a *ifaasv1alph
 			defer wg.Done()
 			pod := &pods[i]
 			port := resolveProbePort(a, pod)
+			start := time.Now()
 			out[i] = r.Prober.Probe(ctx, pod.Namespace, pod.Name, port, path, timeout)
+			metrics.ScaleDownProbeLatencySeconds.Observe(time.Since(start).Seconds())
 		}(i)
 	}
 	wg.Wait()

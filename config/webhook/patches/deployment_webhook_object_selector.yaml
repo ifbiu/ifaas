@@ -1,0 +1,18 @@
+# Restrict the Deployment ValidatingWebhook to objects that opted into ifaas
+# autopilot via the canonical label. Two reasons we narrow it at the manifest
+# level rather than only in-handler:
+#
+#   1. avoids a self-deadlock: the ifaas controller-manager Deployment itself
+#      would otherwise traverse this webhook, and any rollout that happens
+#      while the webhook Service has zero ready endpoints would fail with
+#      "no endpoints available for service ifaas-webhook-service".
+#   2. cuts admission latency for the (vast majority of) Deployments that the
+#      operator does not care about — they never even reach our handler.
+#
+# The in-handler label check stays as a defense-in-depth: if someone widens
+# this selector by hand, the handler still ignores objects without the label.
+- op: add
+  path: /webhooks/0/objectSelector
+  value:
+    matchLabels:
+      ifaas.ifbiu.com/knative-autopilot: enabled

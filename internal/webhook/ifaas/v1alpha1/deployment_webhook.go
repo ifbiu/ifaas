@@ -36,13 +36,19 @@ const (
 )
 
 // SetupDeploymentWebhookWithManager registers the validating webhook for
-// Deployments. The manifest produced by the +kubebuilder:webhook marker
-// below covers every Deployment in the cluster; the in-handler label
-// check then narrows the effective scope to Deployments that opted in
-// via labelEnabled. We chose the in-handler filter (over the marker's
-// objectSelector field, which controller-tools does not surface
-// directly) so that adding/removing the operator label takes effect
-// instantly without re-applying admission manifests.
+// Deployments. The +kubebuilder:webhook marker below covers every
+// Deployment in the cluster at the API level; the actual scope is then
+// narrowed to opted-in workloads in two layers:
+//
+//   - manifest layer: a kustomize patch under config/webhook/patches
+//     injects an objectSelector that matches labelEnabled=labelEnabledValue,
+//     so non-adopted Deployments (including the ifaas controller-manager
+//     itself) never reach the webhook server. This is what prevents the
+//     classic "webhook self-deadlock" during rollout when the webhook
+//     Service has no ready endpoints.
+//   - handler layer: ValidateUpdate below also checks the label, so a
+//     mis-edited admission manifest can never accidentally police more
+//     than the operator owns.
 func SetupDeploymentWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr, &appsv1.Deployment{}).
 		WithValidator(&DeploymentCustomValidator{}).

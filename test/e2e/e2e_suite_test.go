@@ -3,18 +3,7 @@
 
 /*
 Copyright 2026.
-
 Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
 */
 
 package e2e
@@ -22,7 +11,6 @@ package e2e
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -31,89 +19,51 @@ import (
 	"github.com/ifbiu/ifaas/test/utils"
 )
 
+// Suite-level state shared by every spec in the package. We intentionally
+// keep this as plain package vars (rather than a fixture struct) so the
+// Ginkgo trees can reach it without ceremony — the suite is single-run.
 var (
-	// managerImage is the manager image to be built and loaded for testing.
-	managerImage = "example.com/ifaas:v0.0.1"
-	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
-	shouldCleanupCertManager = false
+	clients *utils.Clients
+
+	// e2eImg is the workload image baked by the stub Dockerfile. It must
+	// already be present in the cluster's container runtime; the Makefile
+	// target `setup-test-e2e` is responsible for that.
+	e2eImg string
 )
 
-// TestE2E runs the e2e test suite to validate the solution in an isolated environment.
-// The default setup requires Kind and CertManager.
+// TestE2E is the entry point for `go test -tags=e2e ./test/e2e/...`.
 //
-// To enable kubectl kuberc (use custom kubectl configurations), set: KUBECTL_KUBERC=true
-// By default, kuberc is disabled to ensure consistent test behavior across different environments.
-// To skip CertManager installation, set: CERT_MANAGER_INSTALL_SKIP=true
+// Cluster lifecycle, ifaas deployment and image loading are all driven by
+// the Makefile (`setup-test-e2e`). This suite assumes the cluster is
+// already serving Knative Serving + Eventing CRDs and that the ifaas
+// controller-manager is running in `ifaas-system`. We deliberately do
+// nothing destructive at the cluster scope — every spec works inside a
+// disposable namespace it owns.
 func TestE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
-	_, _ = fmt.Fprintf(GinkgoWriter, "Starting ifaas e2e test suite\n")
-	RunSpecs(t, "e2e suite")
+	_, _ = fmt.Fprintln(GinkgoWriter, "Starting ifaas e2e test suite")
+	RunSpecs(t, "ifaas e2e suite")
 }
 
 var _ = BeforeSuite(func() {
-	By("building the manager image")
-	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", managerImage))
-	_, err := utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager image")
+	By("loading kubeconfig and constructing API clients")
+	c, err := utils.NewClients()
+	Expect(err).NotTo(HaveOccurred(), "kubeconfig must point at the e2e cluster")
+	clients = c
 
-	// TODO(user): If you want to change the e2e test vendor from Kind,
-	// ensure the image is built and available, then remove the following block.
-	By("loading the manager image on Kind")
-	err = utils.LoadImageToKindClusterWithName(managerImage)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager image into Kind")
+	e2eImg = os.Getenv("E2E_STUB_IMG")
+	if e2eImg == "" {
+		e2eImg = "ifaas-scaledownz-stub:e2e"
+	}
 
-	configureKubectlKubeRC()
-	setupCertManager()
+	By("verifying the ifaas controller-manager is Available")
+	expectIfaasReady()
 })
 
-var _ = AfterSuite(func() {
-	teardownCertManager()
-})
-
-// Disable kubectl kuberc by default for test isolation.
-// This prevents local kubectl configurations from affecting test behavior.
-// To enable kuberc, set: KUBECTL_KUBERC=true
-func configureKubectlKubeRC() {
-	if os.Getenv("KUBECTL_KUBERC") != "true" {
-		By("disabling kubectl kuberc for test isolation")
-		err := os.Setenv("KUBECTL_KUBERC", "false")
-		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to disable kubectl kuberc")
-		_, _ = fmt.Fprintf(GinkgoWriter,
-			"kubectl kuberc disabled for consistent test behavior (override with KUBECTL_KUBERC=true)\n")
-	} else {
-		_, _ = fmt.Fprintf(GinkgoWriter, "kubectl kuberc enabled (KUBECTL_KUBERC=true)\n")
-	}
-}
-
-// setupCertManager installs CertManager if needed for webhook tests.
-// Skips installation if CERT_MANAGER_INSTALL_SKIP=true or if already present.
-func setupCertManager() {
-	if os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true" {
-		_, _ = fmt.Fprintf(GinkgoWriter, "Skipping CertManager installation (CERT_MANAGER_INSTALL_SKIP=true)\n")
-		return
-	}
-
-	By("checking if CertManager is already installed")
-	if utils.IsCertManagerCRDsInstalled() {
-		_, _ = fmt.Fprintf(GinkgoWriter, "CertManager is already installed. Skipping installation.\n")
-		return
-	}
-
-	// Mark for cleanup before installation to handle interruptions and partial installs.
-	shouldCleanupCertManager = true
-
-	By("installing CertManager")
-	Expect(utils.InstallCertManager()).To(Succeed(), "Failed to install CertManager")
-}
-
-// teardownCertManager uninstalls CertManager if it was installed by setupCertManager.
-// This ensures we only remove what we installed.
-func teardownCertManager() {
-	if !shouldCleanupCertManager {
-		_, _ = fmt.Fprintf(GinkgoWriter, "Skipping CertManager cleanup (not installed by this suite)\n")
-		return
-	}
-
-	By("uninstalling CertManager")
-	utils.UninstallCertManager()
+func expectIfaasReady() {
+	dep, err := clients.Typed.AppsV1().Deployments("ifaas-system").
+		Get(ctxBackground(), "ifaas-controller-manager", metav1Get())
+	Expect(err).NotTo(HaveOccurred(), "ifaas controller-manager must already be deployed")
+	Expect(dep.Status.AvailableReplicas).To(BeNumerically(">=", 1),
+		"ifaas controller-manager has no Available replicas; run `make setup-test-e2e` first")
 }

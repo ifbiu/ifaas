@@ -29,7 +29,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	kservingv1 "knative.dev/serving/pkg/apis/serving/v1"
 
 	ifaasv1alpha1 "github.com/ifbiu/ifaas/api/ifaas/v1alpha1"
@@ -46,11 +45,6 @@ const (
 	ManagedByLabel = "ifaas.ifbiu.com/managed-by"
 	ManagedByValue = "knative-autopilot"
 	OwnerLabel     = "ifaas.ifbiu.com/owner"
-
-	defaultScaleDownProbePath             = "/scaledownz"
-	defaultScaleDownProbeIntervalSeconds  = int64(30)
-	defaultScaleDownProbeFailureThreshold = int64(20)
-	terminationGracePeriodPaddingSeconds  = int64(5)
 )
 
 // Translate is the only public entry point. It returns a fully populated
@@ -89,14 +83,19 @@ func Translate(dep *appsv1.Deployment, adoption *ifaasv1alpha1.KnativeAdoption) 
 					},
 					Spec: kservingv1.RevisionSpec{
 						PodSpec: corev1.PodSpec{
-							ServiceAccountName:            dep.Spec.Template.Spec.ServiceAccountName,
-							ImagePullSecrets:              dep.Spec.Template.Spec.ImagePullSecrets,
-							Volumes:                       dep.Spec.Template.Spec.Volumes,
-							NodeSelector:                  dep.Spec.Template.Spec.NodeSelector,
-							Tolerations:                   dep.Spec.Template.Spec.Tolerations,
-							Affinity:                      dep.Spec.Template.Spec.Affinity,
-							Containers:                    []corev1.Container{buildUserContainer(primary, adoption, port)},
-							TerminationGracePeriodSeconds: terminationGracePeriod(dep, adoption),
+							ServiceAccountName: dep.Spec.Template.Spec.ServiceAccountName,
+							ImagePullSecrets:   dep.Spec.Template.Spec.ImagePullSecrets,
+							Volumes:            dep.Spec.Template.Spec.Volumes,
+							NodeSelector:       dep.Spec.Template.Spec.NodeSelector,
+							Tolerations:        dep.Spec.Template.Spec.Tolerations,
+							Affinity:           dep.Spec.Template.Spec.Affinity,
+							Containers:         []corev1.Container{buildUserContainer(primary, adoption, port)},
+							// PreStop=/scaledownz and TerminationGracePeriodSeconds are
+							// gated behind Knative `kubernetes.podspec-lifecycle` and
+							// `kubernetes.podspec-termination-grace-period-seconds`
+							// feature gates. Stock Knative rejects them via SSA schema
+							// validation. M1 keeps the KSvc minimal; opt-in surfaces
+							// (CR field / annotation) are deferred — see plan §12.
 						},
 					},
 				},
@@ -200,7 +199,7 @@ func guardBlocked(a *ifaasv1alpha1.KnativeAdoption) bool {
 	return probe.Result == ifaasv1alpha1.ProbeResultFalse
 }
 
-func buildUserContainer(src corev1.Container, a *ifaasv1alpha1.KnativeAdoption, port int32) corev1.Container {
+func buildUserContainer(src corev1.Container, _ *ifaasv1alpha1.KnativeAdoption, _ int32) corev1.Container {
 	c := *src.DeepCopy()
 	// Knative restricts a revision template to a single declared port; downstream
 	// validation runs again at KSvc creation, but trimming here keeps the spec
@@ -208,50 +207,20 @@ func buildUserContainer(src corev1.Container, a *ifaasv1alpha1.KnativeAdoption, 
 	if len(c.Ports) > 1 {
 		c.Ports = []corev1.ContainerPort{c.Ports[0]}
 	}
-	c.Lifecycle = injectPreStop(c.Lifecycle, a, port)
+	// Knative's serving webhook only accepts an empty port name or one of
+	// "h2c" / "http1"; arbitrary user names (e.g. "http", "web") are
+	// rejected outright. HostPort / HostIP are likewise unsupported on
+	// the revision template. Strip them rather than guessing a protocol
+	// label — Knative will infer http1 from the empty name.
+	for i := range c.Ports {
+		c.Ports[i].Name = ""
+		c.Ports[i].HostPort = 0
+		c.Ports[i].HostIP = ""
+	}
+	// Lifecycle.PreStop is intentionally left untouched in M1: writing
+	// PreStop requires the Knative `kubernetes.podspec-lifecycle` feature
+	// gate, which is disabled by default. ScaleDownGuard already enforces
+	// scale-to-zero gating via pods/proxy on /scaledownz, so the PreStop
+	// hook is a strict optimisation deferred to a later opt-in surface.
 	return c
-}
-
-func injectPreStop(cur *corev1.Lifecycle, a *ifaasv1alpha1.KnativeAdoption, userPort int32) *corev1.Lifecycle {
-	path := a.Spec.ScaleDownProbe.Path
-	if path == "" {
-		path = defaultScaleDownProbePath
-	}
-	port := userPort
-	if a.Spec.ScaleDownProbe.Port != nil {
-		port = *a.Spec.ScaleDownProbe.Port
-	}
-	handler := corev1.LifecycleHandler{
-		HTTPGet: &corev1.HTTPGetAction{
-			Path: path,
-			Port: intstr.FromInt32(port),
-		},
-	}
-	if cur == nil {
-		return &corev1.Lifecycle{PreStop: &handler}
-	}
-	out := cur.DeepCopy()
-	out.PreStop = &handler
-	return out
-}
-
-func terminationGracePeriod(dep *appsv1.Deployment, a *ifaasv1alpha1.KnativeAdoption) *int64 {
-	interval := int64(a.Spec.ScaleDownProbe.IntervalSeconds)
-	if interval <= 0 {
-		interval = defaultScaleDownProbeIntervalSeconds
-	}
-	threshold := int64(a.Spec.ScaleDownProbe.ConsecutiveFailureThreshold)
-	if threshold <= 0 {
-		threshold = defaultScaleDownProbeFailureThreshold
-	}
-	desired := interval*threshold + terminationGracePeriodPaddingSeconds
-
-	var origin int64
-	if dep.Spec.Template.Spec.TerminationGracePeriodSeconds != nil {
-		origin = *dep.Spec.Template.Spec.TerminationGracePeriodSeconds
-	}
-	if origin > desired {
-		return &origin
-	}
-	return &desired
 }
