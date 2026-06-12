@@ -147,10 +147,21 @@ func (r *KnativeAdoptionReconciler) runScaleDownGuard(ctx context.Context, adopt
 			r.emitEvent(adoption, eventTypeNormal, EventReasonScaleDownBlocked, msg)
 		}
 	case scaledown.OutcomeNoPods:
-		// All pods are already gone (e.g. KSvc has scaled to zero). The
-		// guard cannot assert anything; keep the previous condition value so
-		// a transient zero-pod gap doesn't flap Allowed → Unknown → Allowed.
-		log.V(1).Info("no pods to probe; leaving guard condition untouched")
+		// pods=0 is the steady state we are gating *toward*: the KSvc has
+		// already scaled to zero, so there is nothing left to refuse. Treat
+		// it as allowed and proactively clear any stale ProbeError /
+		// Degraded condition that may linger from before the workload
+		// drained, otherwise the CR appears stuck on the previous failure
+		// even though the system is healthy.
+		prevAllowed := isCondTrue(adoption, ifaasv1alpha1.ConditionScaleDownAllowed)
+		setCondition(adoption, ifaasv1alpha1.ConditionScaleDownAllowed,
+			metav1.ConditionTrue, ReasonScaleDownAllowed, "ksvc already at zero; no pods to probe")
+		clearConditionIfReason(adoption, ifaasv1alpha1.ConditionDegraded, ReasonScaleDownProbeError)
+		r.enqueueMinScale(adoption, 0, "no-pods")
+		if !prevAllowed {
+			r.emitEvent(adoption, eventTypeNormal, EventReasonScaleDownAllowed, "ksvc already at zero")
+		}
+		log.V(1).Info("no pods to probe; treating as already-at-zero")
 	}
 
 	maybeMarkDegraded(adoption, failureThreshold)
