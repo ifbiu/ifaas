@@ -18,6 +18,7 @@ package scaledown
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -34,9 +35,18 @@ import (
 //
 //	GET /api/v1/namespaces/<ns>/pods/<pod>:<port>/proxy/<path>
 //
-// A 2xx response with body in {true,1,yes,y,ok} (case-insensitive, trimmed)
-// → Allowed=true. Anything else (non-2xx, parse failure, transport error,
-// timeout, unreachable) → Result.Err is set and Allowed stays false.
+// The response body is decoded in two compatible shapes (in priority order):
+//
+//  1. JSON object per ckbackup-scaledownz-design.md §"`/scaledownz` 协议":
+//     `{"allowScaleDown": <bool>, "inFlight": <int>}` — `.allowScaleDown`
+//     drives the result. This is the canonical contract for new workloads.
+//  2. Plain text, trimmed and lowercased, in {"true","1","yes","y","ok"} —
+//     accepted as a legacy / stub fallback so existing simple endpoints keep
+//     working without a redeploy.
+//
+// Anything else (non-2xx, parse failure on neither shape, transport error,
+// timeout, unreachable) → Result.Err is set when transport-level and Allowed
+// stays false otherwise.
 type HTTPProber struct {
 	rc rest.Interface
 }
@@ -80,12 +90,28 @@ func (p *HTTPProber) Probe(ctx context.Context, namespace, podName string, port 
 		res.Err = err
 		return res
 	}
-	res.Allowed = parseBool(body)
+	res.Allowed = parseAllowScaleDown(body)
 	return res
 }
 
-func parseBool(b []byte) bool {
-	switch strings.ToLower(strings.TrimSpace(string(b))) {
+// parseAllowScaleDown extracts the boolean verdict from the /scaledownz
+// response body. JSON object form takes priority; plain-text form is kept
+// as a backwards-compatible fallback for stubs and minimal endpoints.
+func parseAllowScaleDown(b []byte) bool {
+	s := strings.TrimSpace(string(b))
+	if s == "" {
+		return false
+	}
+	if s[0] == '{' {
+		var resp struct {
+			AllowScaleDown *bool `json:"allowScaleDown"`
+		}
+		if err := json.Unmarshal([]byte(s), &resp); err == nil && resp.AllowScaleDown != nil {
+			return *resp.AllowScaleDown
+		}
+		return false
+	}
+	switch strings.ToLower(s) {
 	case "true", "1", "yes", "y", "ok":
 		return true
 	}
