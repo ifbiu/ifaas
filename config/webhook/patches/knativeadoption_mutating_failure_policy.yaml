@@ -1,0 +1,19 @@
+# Soften the failurePolicy on the KnativeAdoption mutating webhook from
+# Fail (controller-gen default) to Ignore.
+#
+# Rationale: KnativeAdoption is the *control surface* the operator and human
+# operators use to opt a workload in or out of autopilot. If the operator
+# Deployment is wedged (zero replicas, crashlooping image, broken admission
+# rule, etc.) we still want operators to be able to mutate KnativeAdoption
+# CRs to either roll back the experiment or kick the controller — Ignore
+# guarantees a missing webhook Service does not turn the CR API itself into
+# a gated path. The defaulting logic the webhook performs is best-effort
+# (mirror existing fields, fill in empty Spec defaults) and the controller
+# re-asserts the same defaults on reconcile, so skipping it in the rare
+# webhook-down window is safe.
+#
+# Index 0 of the mutating list is mknativeadoption-v1alpha1.kb.io
+# (manifests.yaml currently registers exactly one mutating webhook).
+- op: replace
+  path: /webhooks/0/failurePolicy
+  value: Ignore

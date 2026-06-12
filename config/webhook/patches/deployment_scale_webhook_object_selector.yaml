@@ -1,0 +1,26 @@
+# Mirror of patches/deployment_webhook_object_selector.yaml for the
+# deployments/scale validating webhook. Without this patch every scale call
+# in the cluster (kubelet probes notwithstanding, but every controller-issued
+# scale, every kubectl scale, every HPA / KPA tick on every workload) would
+# round-trip through the ifaas webhook Service.
+#
+# Two failure modes that motivates narrowing it here:
+#
+#   1. self-deadlock: when the ifaas controller-manager itself is at zero
+#      replicas (rolled out, evicted, or scaled down for any reason), the
+#      webhook Service has no endpoints, failurePolicy=Fail makes every
+#      scale subresource UPDATE fail cluster-wide, and nothing — including
+#      the operator's own Deployment — can come back up without a human
+#      manually deleting the ValidatingWebhookConfiguration.
+#   2. blast radius: KPA-managed `<revision>-deployment` objects do not
+#      carry the autopilot label, so the webhook has no business gating
+#      their scale traffic; admitting Knative's own scale calls keeps
+#      scale-to-zero working when the operator is healthy too.
+#
+# Index 1 of the validating list is vdeploymentscale-v1.kb.io (manifests.yaml
+# orders entries vdeployment, vdeploymentscale, vknativeadoption).
+- op: add
+  path: /webhooks/1/objectSelector
+  value:
+    matchLabels:
+      ifaas.ifbiu.com/knative-autopilot: enabled

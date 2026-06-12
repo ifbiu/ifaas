@@ -1,0 +1,14 @@
+# Mirror of knativeadoption_mutating_failure_policy.yaml for the validating
+# side. Same operator-rescue argument applies: if the webhook Service is
+# down we still want CREATE/UPDATE on KnativeAdoption to succeed so a
+# human can change spec.suspended, change minScale, or delete the CR
+# entirely to release the underlying user Deployment. Validation rules
+# we encode here (mode immutability, range checks) are nice-to-have, not
+# correctness-critical — the controller does its own validation on
+# reconcile and refuses to act on illegal Specs.
+#
+# Index 2 of the validating list is vknativeadoption-v1alpha1.kb.io
+# (order: vdeployment, vdeploymentscale, vknativeadoption).
+- op: replace
+  path: /webhooks/2/failurePolicy
+  value: Ignore

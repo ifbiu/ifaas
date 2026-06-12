@@ -2,10 +2,23 @@ resources:
 - manifests.yaml
 - service.yaml
 
-# JSON-patch to scope vdeployment-v1.kb.io to autopilot-labeled objects only.
-# See patches/deployment_webhook_object_selector.yaml for the rationale; the
-# patch index 0 below points at the first webhook entry of
-# ValidatingWebhookConfiguration in manifests.yaml, which is vdeployment-v1.kb.io.
+# All four webhooks below are tightened against self-deadlock and blast
+# radius. Two patch families:
+#
+#   A. objectSelector patches (deployment_*_webhook_object_selector.yaml)
+#      restrict Deployment / Deployment scale admission to objects bearing
+#      the autopilot opt-in label. Without this every Deployment scale call
+#      cluster-wide would route through ifaas-webhook-service, and a wedged
+#      operator (zero endpoints) would block its own recovery.
+#   B. failurePolicy patches (knativeadoption_*_failure_policy.yaml) flip
+#      the KnativeAdoption admission paths from Fail to Ignore so the CR
+#      itself stays editable when the webhook Service is unhealthy — that
+#      CR is the human-operator escape hatch.
+#
+# Patches keep the in-handler label gate as defense in depth. Webhook
+# array indices reflect the order controller-gen emits in manifests.yaml:
+#   ValidatingWebhookConfiguration: [vdeployment, vdeploymentscale, vknativeadoption]
+#   MutatingWebhookConfiguration:   [mknativeadoption]
 patches:
 - path: patches/deployment_webhook_object_selector.yaml
   target:
@@ -13,3 +26,21 @@ patches:
     version: v1
     kind: ValidatingWebhookConfiguration
     name: validating-webhook-configuration
+- path: patches/deployment_scale_webhook_object_selector.yaml
+  target:
+    group: admissionregistration.k8s.io
+    version: v1
+    kind: ValidatingWebhookConfiguration
+    name: validating-webhook-configuration
+- path: patches/knativeadoption_validating_failure_policy.yaml
+  target:
+    group: admissionregistration.k8s.io
+    version: v1
+    kind: ValidatingWebhookConfiguration
+    name: validating-webhook-configuration
+- path: patches/knativeadoption_mutating_failure_policy.yaml
+  target:
+    group: admissionregistration.k8s.io
+    version: v1
+    kind: MutatingWebhookConfiguration
+    name: mutating-webhook-configuration
