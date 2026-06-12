@@ -217,6 +217,19 @@ Conditions（写回 `KnativeAdoption.status.conditions`，沿用 K8s 约定）�
 | `livenessProbe / readinessProbe.tcpSocket(非 user-port)` | 翻译成 `userPort` probe |
 | 非 HTTP 协议端口 | 拒绝接管，写 Condition `UnsupportedProtocol=True` |
 
+### 6.3 M1 实现注（translator 白名单）
+
+为了不被 `kubernetes.podspec-*` feature flag 集合拒收，M1 落地的 translator 走"显式白名单"而非"原样透传"：
+
+- `containers[i]`：仅保留 `name / image / command / args / env / envFrom / resources / ports / volumeMounts / readinessProbe / livenessProbe / lifecycle / securityContext`；其余字段（含 `terminationMessagePath / terminationMessagePolicy / imagePullPolicy` 之外的所有未列字段）剥离。
+- `env[].valueFrom`：仅保留 `configMapKeyRef / secretKeyRef`，**丢弃** `fieldRef`、`resourceFieldRef`（KSvc 默认 feature flag 不放行 Downward API）。
+- `volumes[]`：仅保留 `configMap / secret / emptyDir / projected / persistentVolumeClaim`；其余（`hostPath / downwardAPI / nfs / awsEBS / …`）丢弃。
+- `ports[]`：保留 `containerPort / protocol / name`；丢弃 `hostPort / hostIP`。
+- PodSpec 顶层：**丢弃** `nodeSelector / tolerations / affinity / topologySpreadConstraints / hostAliases / dnsPolicy / dnsConfig / hostNetwork / hostPID / hostIPC`，仅保留 `containers / volumes / serviceAccountName / imagePullSecrets / restartPolicy / terminationGracePeriodSeconds / securityContext / enableServiceLinks / shareProcessNamespace`。
+- `metadata`：仅保留 ifaas/knative 自管理的 label 与 annotation（`autoscaling.knative.dev/*`、`ifaas.ifbiu.com/*`），其它一律剥离，避免把 Helm/Argo 注入的 `argocd.argoproj.io/*` 之类带进 KSvc Revision 的 podSpec 里污染同步对账。
+
+落地代码参考：`ifaas/internal/translator/translator.go` 中的 `sanitizeContainer / sanitizeVolumes / sanitizePorts / buildPodSpec` 三件套。
+
 ### 6.3 流量入口
 - **原 K8s `Service` 会被接管**（同名替换），客户端 DNS `<svc>.<ns>.svc.cluster.local` 行为保持不变，详见 §8.6。
 - `KnativeAdoption.status.url` 同时暴露 KSvc 公网 URL，供 CI/CD 或外部网关使用。
@@ -565,6 +578,7 @@ KnativeAdoption ─── 1:1 ──► Trigger (operator owned) ──► KSvc
    - 在 KnativeAdoption.status 输出建议的 `ignoreDifferences` 片段；
    - 接管时给被托管对象打 `argocd.argoproj.io/sync-options=Prune=false,Replace=true`；
    - 文档化要求用户在 Application 加 `ignoreDifferences`。
+   - **Argo 同步必须用 ServerSideApply + RespectIgnoreDifferences**：M1 webhook 的 owner 判定依赖 `metadata.managedFields`，client-side apply（默认 strategic merge patch）写入时 `fieldManager` 会落到 `kubectl-client-side-apply`，被 webhook 视为外部用户手改而拒绝；必须给 Application 加 `syncOptions: [ServerSideApply=true, RespectIgnoreDifferences=true]`，让 Argo 用 `fieldManager=argocd-controller` SSA、并尊重 `ignoreDifferences /spec/replicas`。chart 已在 `helmrepo/appmeta/templates/application.yaml` 中按 `ifaasAutopilot.enabled` 自动渲染，无需手工拼。
 9. **RBAC 与多租户**：operator 需要 cluster-wide 的 Deployment R/W、KSvc R/W、Trigger R/W（仅 mode=eventing 命名空间生效）；建议加 namespace 白名单。
 10. **可观测性**：metrics 至少导出
    - `autopilot_adopted_total{namespace}`
@@ -632,7 +646,10 @@ KnativeAdoption ─── 1:1 ──► Trigger (operator owned) ──► KSvc
   - 接管前对样本 pod（如果有）做一次 `/scaledownz` 预检（HEAD 或 GET，超时 2s），失败拒绝接管。
   - `mode=eventing` 时 broker annotation 不为空。
 - [ ] MutatingWebhook（可选 / P2）：自动注入推荐 annotation 默认值（`min-scale=0`、`target=10`、`scaledown-probe-path=/scaledownz`）。
-- [ ] 同时在 Deployment 上挂一个**轻量 Validating Webhook**：拦截「带 autopilot label 的 Deployment 被用户手动改 `spec.replicas`」，避免与 ScaleDownGuard 互斗。
+- [ ] **Deployment replicas 互斥保护（M1 已落地）**——为避免与 `quiesceSource` 互斗、并兼容 ArgoCD ServerSideApply，落地实现采用「以 `metadata.managedFields` 的 owner 为准」的判定，覆盖两类入口：
+  - `apps/v1 Deployments` 主资源 UPDATE：解析 `metadata.managedFields` 中 `f:spec.f:replicas` 的最近写入者；若该 owner 不是 `ifaas-autopilot` 也不是接管前已存在的合法外部 owner（如 `argocd-controller`、`helm`），则拒绝；带 `ifaas.ifbiu.com/knative-autopilot=enabled` label 的 Deployment 被外部用 client-side patch 改 replicas → 拒绝。
+  - `apps/v1 Deployments/scale` 子资源 UPDATE（拦截 `kubectl scale` / HPA / Argo `actions/scale`）：用同一套 owner 判定 + 调用方 SubjectAccessReview 二选一。子资源对象（`Scale`）没有 label，处理函数内部需要先 GET 父 Deployment 拿到 label 再决定是否拦。
+  - 落地代码：`ifaas/internal/webhook/ifaas/v1alpha1/deployment_webhook.go`、`deployment_scale_webhook.go`，注册路径 `/validate-apps-v1-deployments` 与 `/validate-apps-v1-deployments-scale`。
 
 ### 10.5 测试
 - [ ] 单元测试覆盖 `translator` 各分支（含 preStop 注入、port 选择）。

@@ -58,8 +58,7 @@ func Translate(dep *appsv1.Deployment, adoption *ifaasv1alpha1.KnativeAdoption) 
 	if err != nil {
 		return nil, err
 	}
-	port, err := pickUserPort(primary)
-	if err != nil {
+	if _, err := pickUserPort(primary); err != nil {
 		return nil, err
 	}
 
@@ -82,20 +81,20 @@ func Translate(dep *appsv1.Deployment, adoption *ifaasv1alpha1.KnativeAdoption) 
 						Labels:      labels,
 					},
 					Spec: kservingv1.RevisionSpec{
+						// PodSpec subset accepted by stock Knative serving with no
+						// feature gates open. NodeSelector / Tolerations / Affinity
+						// / TerminationGracePeriodSeconds / DNSPolicy / RestartPolicy
+						// / HostAliases / SchedulerName / PriorityClassName are all
+						// gated behind kubernetes.podspec-* features; the operator
+						// does not assume any are open cluster-side, so adopted
+						// Deployments surrender those scheduling hints when
+						// projected. PreStop / TerminationGracePeriodSeconds opt-in
+						// surfaces are deferred — see plan §12.
 						PodSpec: corev1.PodSpec{
 							ServiceAccountName: dep.Spec.Template.Spec.ServiceAccountName,
 							ImagePullSecrets:   dep.Spec.Template.Spec.ImagePullSecrets,
-							Volumes:            dep.Spec.Template.Spec.Volumes,
-							NodeSelector:       dep.Spec.Template.Spec.NodeSelector,
-							Tolerations:        dep.Spec.Template.Spec.Tolerations,
-							Affinity:           dep.Spec.Template.Spec.Affinity,
-							Containers:         []corev1.Container{buildUserContainer(primary, adoption, port)},
-							// PreStop=/scaledownz and TerminationGracePeriodSeconds are
-							// gated behind Knative `kubernetes.podspec-lifecycle` and
-							// `kubernetes.podspec-termination-grace-period-seconds`
-							// feature gates. Stock Knative rejects them via SSA schema
-							// validation. M1 keeps the KSvc minimal; opt-in surfaces
-							// (CR field / annotation) are deferred — see plan §12.
+							Volumes:            sanitizeVolumes(dep.Spec.Template.Spec.Volumes),
+							Containers:         []corev1.Container{sanitizeContainer(primary)},
 						},
 					},
 				},
@@ -199,28 +198,101 @@ func guardBlocked(a *ifaasv1alpha1.KnativeAdoption) bool {
 	return probe.Result == ifaasv1alpha1.ProbeResultFalse
 }
 
-func buildUserContainer(src corev1.Container, _ *ifaasv1alpha1.KnativeAdoption, _ int32) corev1.Container {
-	c := *src.DeepCopy()
-	// Knative restricts a revision template to a single declared port; downstream
-	// validation runs again at KSvc creation, but trimming here keeps the spec
-	// minimal and the diff readable.
-	if len(c.Ports) > 1 {
-		c.Ports = []corev1.ContainerPort{c.Ports[0]}
+// sanitizeContainer returns a copy of src restricted to the Container fields
+// stock Knative serving accepts in a RevisionTemplate with no feature gates
+// open. Anything outside the allow-list is intentionally dropped:
+//   - Lifecycle (gated by kubernetes.podspec-lifecycle)
+//   - VolumeDevices (gated by kubernetes.podspec-volumes-devices)
+//   - Stdin / StdinOnce / TTY (not declared in KSvc Container schema)
+//   - Env entries with valueFrom.fieldRef / resourceFieldRef (gated by
+//     kubernetes.podspec-fieldref); the entire EnvVar is dropped because
+//     surfacing a name-only entry would silently change app behaviour.
+//
+// ScaleDownGuard already enforces graceful scale-to-zero via /scaledownz, so
+// dropping Lifecycle.PreStop is semantically harmless; the gate-aware opt-in
+// surface is deferred — see plan §12.
+func sanitizeContainer(src corev1.Container) corev1.Container {
+	return corev1.Container{
+		Name:                     src.Name,
+		Image:                    src.Image,
+		Command:                  src.Command,
+		Args:                     src.Args,
+		WorkingDir:               src.WorkingDir,
+		Ports:                    sanitizePorts(src.Ports),
+		EnvFrom:                  src.EnvFrom,
+		Env:                      sanitizeEnv(src.Env),
+		Resources:                src.Resources,
+		VolumeMounts:             src.VolumeMounts,
+		LivenessProbe:            src.LivenessProbe,
+		ReadinessProbe:           src.ReadinessProbe,
+		StartupProbe:             src.StartupProbe,
+		TerminationMessagePath:   src.TerminationMessagePath,
+		TerminationMessagePolicy: src.TerminationMessagePolicy,
+		ImagePullPolicy:          src.ImagePullPolicy,
+		SecurityContext:          src.SecurityContext,
 	}
-	// Knative's serving webhook only accepts an empty port name or one of
-	// "h2c" / "http1"; arbitrary user names (e.g. "http", "web") are
-	// rejected outright. HostPort / HostIP are likewise unsupported on
-	// the revision template. Strip them rather than guessing a protocol
-	// label — Knative will infer http1 from the empty name.
-	for i := range c.Ports {
-		c.Ports[i].Name = ""
-		c.Ports[i].HostPort = 0
-		c.Ports[i].HostIP = ""
+}
+
+// sanitizeEnv drops EnvVar entries whose value comes from a downward API
+// reference. Stock Knative gates `kubernetes.podspec-fieldref`, so SSA
+// rejects the patch otherwise. We drop the entire entry rather than blank
+// the value — leaving an empty Env slot would let the application read an
+// empty string instead of (e.g.) the pod IP, which is a surprise we'd
+// rather surface as "the variable is not set" than as "it is set wrongly".
+func sanitizeEnv(src []corev1.EnvVar) []corev1.EnvVar {
+	if len(src) == 0 {
+		return nil
 	}
-	// Lifecycle.PreStop is intentionally left untouched in M1: writing
-	// PreStop requires the Knative `kubernetes.podspec-lifecycle` feature
-	// gate, which is disabled by default. ScaleDownGuard already enforces
-	// scale-to-zero gating via pods/proxy on /scaledownz, so the PreStop
-	// hook is a strict optimisation deferred to a later opt-in surface.
-	return c
+	out := make([]corev1.EnvVar, 0, len(src))
+	for _, e := range src {
+		if e.ValueFrom != nil &&
+			(e.ValueFrom.FieldRef != nil || e.ValueFrom.ResourceFieldRef != nil) {
+			continue
+		}
+		out = append(out, e)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// sanitizePorts keeps at most one port and clears Name / HostPort / HostIP.
+// Knative's serving webhook only accepts an empty port name or one of "h2c" /
+// "http1"; arbitrary user names like "http" are rejected outright. HostPort
+// is rejected upstream by guardPodSpec, so it never reaches the sanitiser;
+// HostIP is silently cleared as a defensive nicety.
+func sanitizePorts(ports []corev1.ContainerPort) []corev1.ContainerPort {
+	if len(ports) == 0 {
+		return nil
+	}
+	p := *ports[0].DeepCopy()
+	p.Name = ""
+	p.HostPort = 0
+	p.HostIP = ""
+	return []corev1.ContainerPort{p}
+}
+
+// sanitizeVolumes keeps only volume sources stock Knative accepts. PVC,
+// generic ephemeral, hostPath, csi, and friends are all gated behind
+// kubernetes.podspec-* feature flags and silently dropped here.
+func sanitizeVolumes(src []corev1.Volume) []corev1.Volume {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]corev1.Volume, 0, len(src))
+	for _, v := range src {
+		switch {
+		case v.ConfigMap != nil,
+			v.Secret != nil,
+			v.EmptyDir != nil,
+			v.Projected != nil,
+			v.DownwardAPI != nil:
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

@@ -144,7 +144,7 @@ func TestTranslate_NoPreStopInjectedByDefault(t *testing.T) {
 	}
 }
 
-func TestTranslate_PreservesUserAuthoredLifecycle(t *testing.T) {
+func TestTranslate_StripsUserAuthoredLifecycle(t *testing.T) {
 	cs := basicContainer("app", 8080)
 	cs.Lifecycle = &corev1.Lifecycle{
 		PostStart: &corev1.LifecycleHandler{Exec: &corev1.ExecAction{Command: []string{"echo"}}},
@@ -157,12 +157,60 @@ func TestTranslate_PreservesUserAuthoredLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	c := ksvc.Spec.Template.Spec.Containers[0]
-	if c.Lifecycle == nil || c.Lifecycle.PostStart == nil || c.Lifecycle.PostStart.Exec == nil {
-		t.Errorf("user PostStart should be preserved verbatim: %#v", c.Lifecycle)
+	if c := ksvc.Spec.Template.Spec.Containers[0]; c.Lifecycle != nil {
+		t.Fatalf("user-authored Lifecycle must be stripped (gated behind kubernetes.podspec-lifecycle): %#v", c.Lifecycle)
 	}
-	if c.Lifecycle.PreStop == nil || c.Lifecycle.PreStop.Exec == nil {
-		t.Errorf("user PreStop should be preserved verbatim: %#v", c.Lifecycle.PreStop)
+}
+
+func TestTranslate_StripsContainerGatedFields(t *testing.T) {
+	cs := basicContainer("app", 8080)
+	cs.Stdin = true
+	cs.StdinOnce = true
+	cs.TTY = true
+	cs.VolumeDevices = []corev1.VolumeDevice{{Name: "blk", DevicePath: "/dev/blk0"}}
+	dep := newDeployment("hello", "default", []corev1.Container{cs})
+	a := newAdoption("hello", "default")
+
+	ksvc, err := Translate(dep, a)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	c := ksvc.Spec.Template.Spec.Containers[0]
+	if c.Stdin || c.StdinOnce || c.TTY {
+		t.Errorf("Stdin/StdinOnce/TTY must be cleared, got stdin=%v stdinOnce=%v tty=%v", c.Stdin, c.StdinOnce, c.TTY)
+	}
+	if len(c.VolumeDevices) != 0 {
+		t.Errorf("VolumeDevices must be stripped (gated), got %#v", c.VolumeDevices)
+	}
+}
+
+func TestTranslate_StripsEnvFieldRef(t *testing.T) {
+	cs := basicContainer("app", 8080)
+	cs.Env = []corev1.EnvVar{
+		{Name: "FOO", Value: "literal"},
+		{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}},
+		{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+		{Name: "CPU_REQ", ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{Resource: "requests.cpu"}}},
+		{Name: "CFG", ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "cfg"}, Key: "k"}}},
+		{Name: "SEC", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "sec"}, Key: "k"}}},
+	}
+	dep := newDeployment("hello", "default", []corev1.Container{cs})
+	a := newAdoption("hello", "default")
+
+	ksvc, err := Translate(dep, a)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := ksvc.Spec.Template.Spec.Containers[0].Env
+	names := map[string]bool{}
+	for _, e := range got {
+		names[e.Name] = true
+	}
+	if !names["FOO"] || !names["CFG"] || !names["SEC"] {
+		t.Errorf("literal/configMapKeyRef/secretKeyRef must survive, got %#v", got)
+	}
+	if names["POD_IP"] || names["POD_NAME"] || names["CPU_REQ"] {
+		t.Errorf("downward-API env entries must be dropped (kubernetes.podspec-fieldref gated): %#v", got)
 	}
 }
 
@@ -315,15 +363,18 @@ func TestTranslate_PortSanitisation(t *testing.T) {
 
 // --- volumes / passthrough ---------------------------------------------
 
-func TestTranslate_VolumesPassthrough(t *testing.T) {
+func TestTranslate_VolumesAllowAndStrip(t *testing.T) {
 	dep := newDeployment("hello", "default", []corev1.Container{basicContainer("app", 8080)}, func(d *appsv1.Deployment) {
 		d.Spec.Template.Spec.Volumes = []corev1.Volume{
 			{Name: "cm", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "app-cfg"}}}},
+			{Name: "ed", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+			// Gated volume sources stock Knative rejects: PVC, hostPath, csi, ephemeral.
 			{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data-pvc"}}},
+			{Name: "host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/var/host"}}},
 		}
 		d.Spec.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{
 			{Name: "cm", MountPath: "/etc/app"},
-			{Name: "data", MountPath: "/var/data"},
+			{Name: "ed", MountPath: "/cache"},
 		}
 	})
 	a := newAdoption("hello", "default")
@@ -333,11 +384,17 @@ func TestTranslate_VolumesPassthrough(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	vols := ksvc.Spec.Template.Spec.Volumes
-	if len(vols) != 2 || vols[0].Name != "cm" || vols[1].Name != "data" {
-		t.Fatalf("volumes not passthrough: %#v", vols)
+	if len(vols) != 2 {
+		t.Fatalf("want 2 volumes (cm, ed) after strip, got %d: %#v", len(vols), vols)
 	}
-	if vols[1].PersistentVolumeClaim == nil || vols[1].PersistentVolumeClaim.ClaimName != "data-pvc" {
-		t.Errorf("PVC volume lost: %#v", vols[1])
+	names := map[string]bool{vols[0].Name: true, vols[1].Name: true}
+	if !names["cm"] || !names["ed"] {
+		t.Errorf("allow-listed volumes lost: %#v", vols)
+	}
+	for _, v := range vols {
+		if v.PersistentVolumeClaim != nil || v.HostPath != nil {
+			t.Errorf("gated volume source survived sanitisation: %#v", v)
+		}
 	}
 	mounts := ksvc.Spec.Template.Spec.Containers[0].VolumeMounts
 	if len(mounts) != 2 {
@@ -345,12 +402,21 @@ func TestTranslate_VolumesPassthrough(t *testing.T) {
 	}
 }
 
-func TestTranslate_PodLevelPassthrough(t *testing.T) {
+func TestTranslate_PodLevelAllowAndStrip(t *testing.T) {
 	dep := newDeployment("hello", "default", []corev1.Container{basicContainer("app", 8080)}, func(d *appsv1.Deployment) {
 		d.Spec.Template.Spec.ServiceAccountName = "team-a"
 		d.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "regcred"}}
+		// Gated PodSpec fields stock Knative rejects without feature gates open.
 		d.Spec.Template.Spec.NodeSelector = map[string]string{"zone": "a"}
 		d.Spec.Template.Spec.Tolerations = []corev1.Toleration{{Key: "spot", Operator: corev1.TolerationOpExists}}
+		d.Spec.Template.Spec.Affinity = &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{{Weight: 1}},
+			},
+		}
+		d.Spec.Template.Spec.TerminationGracePeriodSeconds = ptrInt64(30)
+		d.Spec.Template.Spec.DNSPolicy = corev1.DNSClusterFirst
+		d.Spec.Template.Spec.RestartPolicy = corev1.RestartPolicyAlways
 	})
 	a := newAdoption("hello", "default")
 
@@ -360,16 +426,28 @@ func TestTranslate_PodLevelPassthrough(t *testing.T) {
 	}
 	ps := ksvc.Spec.Template.Spec
 	if ps.ServiceAccountName != "team-a" {
-		t.Errorf("serviceAccount not passthrough: %s", ps.ServiceAccountName)
+		t.Errorf("serviceAccount must passthrough, got %q", ps.ServiceAccountName)
 	}
 	if len(ps.ImagePullSecrets) != 1 || ps.ImagePullSecrets[0].Name != "regcred" {
-		t.Errorf("imagePullSecrets not passthrough: %#v", ps.ImagePullSecrets)
+		t.Errorf("imagePullSecrets must passthrough: %#v", ps.ImagePullSecrets)
 	}
-	if ps.NodeSelector["zone"] != "a" {
-		t.Errorf("nodeSelector not passthrough: %#v", ps.NodeSelector)
+	if ps.NodeSelector != nil {
+		t.Errorf("NodeSelector must be stripped (gated): %#v", ps.NodeSelector)
 	}
-	if len(ps.Tolerations) != 1 || ps.Tolerations[0].Key != "spot" {
-		t.Errorf("tolerations not passthrough: %#v", ps.Tolerations)
+	if len(ps.Tolerations) != 0 {
+		t.Errorf("Tolerations must be stripped (gated): %#v", ps.Tolerations)
+	}
+	if ps.Affinity != nil {
+		t.Errorf("Affinity must be stripped (gated): %#v", ps.Affinity)
+	}
+	if ps.TerminationGracePeriodSeconds != nil {
+		t.Errorf("TerminationGracePeriodSeconds must be stripped (gated): %d", *ps.TerminationGracePeriodSeconds)
+	}
+	if ps.DNSPolicy != "" {
+		t.Errorf("DNSPolicy must be stripped (gated): %q", ps.DNSPolicy)
+	}
+	if ps.RestartPolicy != "" {
+		t.Errorf("RestartPolicy must be stripped (gated): %q", ps.RestartPolicy)
 	}
 }
 

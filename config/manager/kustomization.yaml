@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: ifaas
-  newTag: e2e
+  newTag: p8-5f4dc3a-dirty

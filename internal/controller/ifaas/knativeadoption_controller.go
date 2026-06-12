@@ -27,6 +27,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -336,10 +337,29 @@ func (r *KnativeAdoptionReconciler) quiesceSource(ctx context.Context, a *ifaasv
 		a.Status.SourceSnapshot.Replicas = &snap
 	}
 
-	patch := client.MergeFrom(dep.DeepCopy())
-	zero := int32(0)
-	dep.Spec.Replicas = &zero
-	if err := r.Patch(ctx, dep, patch); err != nil {
+	// Server-side apply with FieldOwner=FieldOwner pins ownership of
+	// `spec.replicas` to the operator's manager identity. The validating
+	// Deployment webhook (S8) keys on this exact ownership when telling
+	// "phantom" defaulting writes apart from real manual scale-ups: as
+	// long as no external client declares the field, ownership stays
+	// here and the 0→>0 ban does not fire on harmless GitOps drift.
+	//
+	// We build the apply object via Unstructured rather than a typed
+	// appsv1.Deployment so the JSON wire form contains *only* the
+	// fields we mean to claim (apiVersion, kind, name/namespace,
+	// spec.replicas). A typed zero-valued DeploymentSpec serialises
+	// `"selector": null` and an empty `"template"` object, both of
+	// which the apiserver interprets as "caller wants to clear these
+	// immutable fields" and rejects with a validation error.
+	apply := &unstructured.Unstructured{}
+	apply.SetAPIVersion("apps/v1")
+	apply.SetKind("Deployment")
+	apply.SetNamespace(dep.Namespace)
+	apply.SetName(dep.Name)
+	if err := unstructured.SetNestedField(apply.Object, int64(0), "spec", "replicas"); err != nil {
+		return fmt.Errorf("compose ssa replicas patch: %w", err)
+	}
+	if err := r.Patch(ctx, apply, client.Apply, client.FieldOwner(FieldOwner), client.ForceOwnership); err != nil {
 		return fmt.Errorf("scale deployment to zero: %w", err)
 	}
 	return nil

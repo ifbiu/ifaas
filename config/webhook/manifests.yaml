@@ -55,6 +55,25 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-apps-v1-deployments-scale
+  failurePolicy: Fail
+  name: vdeploymentscale-v1.kb.io
+  rules:
+  - apiGroups:
+    - apps
+    apiVersions:
+    - v1
+    operations:
+    - UPDATE
+    resources:
+    - deployments/scale
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-ifaas-ifbiu-com-v1alpha1-knativeadoption
   failurePolicy: Fail
   name: vknativeadoption-v1alpha1.kb.io

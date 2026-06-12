@@ -18,11 +18,13 @@ package v1alpha1
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 
 	appsv1 "k8s.io/api/apps/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -34,6 +36,18 @@ import (
 const (
 	labelEnabled      = "ifaas.ifbiu.com/knative-autopilot"
 	labelEnabledValue = "enabled"
+)
+
+// fieldOwner* mirror the SSA fieldManager names used by the operator's
+// reconcilers (controller package: FieldOwner / FieldOwnerWatcher).
+// Duplicated for the same reason as labelEnabled above. The webhook uses
+// these names as the canonical anchor for "is spec.replicas currently
+// owned by ifaas itself?": any other manager wins ownership only when a
+// caller has explicitly declared the field, which is the discriminator
+// the validator needs to tell phantom defaulting from real intent.
+const (
+	fieldOwnerAutopilot = "ifaas-autopilot"
+	fieldOwnerWatcher   = "ifaas-watcher"
 )
 
 // envControllerUsername names the env var that pins the operator's own
@@ -67,9 +81,24 @@ func SetupDeploymentWebhookWithManager(mgr ctrl.Manager) error {
 	if user == "" {
 		user = defaultControllerUsername
 	}
-	return ctrl.NewWebhookManagedBy(mgr, &appsv1.Deployment{}).
+	if err := ctrl.NewWebhookManagedBy(mgr, &appsv1.Deployment{}).
 		WithValidator(&DeploymentCustomValidator{ControllerUsername: user}).
-		Complete()
+		Complete(); err != nil {
+		return err
+	}
+	// Subresource webhook for /scale. Cannot be expressed via
+	// NewWebhookManagedBy because controller-runtime keys the validator on
+	// the Go type *appsv1.Deployment, while the apiserver delivers
+	// autoscaling/v1.Scale on this path. We register the raw admission
+	// handler on the same webhook server so both endpoints share the cert
+	// material and lifecycle.
+	mgr.GetWebhookServer().Register(DeploymentScaleWebhookPath, &webhook.Admission{
+		Handler: &DeploymentScaleValidator{
+			Reader:             mgr.GetAPIReader(),
+			ControllerUsername: user,
+		},
+	})
+	return nil
 }
 
 // +kubebuilder:webhook:path=/validate-apps-v1-deployment,mutating=false,failurePolicy=fail,sideEffects=None,groups=apps,resources=deployments,verbs=update,versions=v1,name=vdeployment-v1.kb.io,admissionReviewVersions=v1
@@ -81,12 +110,38 @@ func SetupDeploymentWebhookWithManager(mgr ctrl.Manager) error {
 // up bypasses the guard's quiesced state and would re-introduce the very
 // race S5/S6 are designed to prevent.
 //
+// Discriminator — phantom defaulting vs real intent:
+//
+// The naive "oldReplicas==0 && newReplicas>0" check breaks under the
+// K8s admission pipeline: PATCH operations are decoded → defaulted →
+// (mutating webhooks) → validated, and the OpenAPI defaulter rewrites
+// a nil Deployment.spec.replicas to ptr(1) before this validator ever
+// runs. A client-side `kubectl apply` that removes the field from its
+// last-applied configuration sends a strategic-merge patch with
+// `{"spec":{"replicas":null}}` whose only effect is to relinquish the
+// caller's ownership of the field; the apiserver's default-fill makes
+// the resulting object look identical to a deliberate "scale to 1",
+// even though the caller has expressed no such intent. GitOps tools
+// (Argo with ignoreDifferences, fluxcd with --dry-run=server, …) hit
+// this corner all the time, and end up self-blocked against their
+// own correct reconciliation.
+//
+// We resolve the ambiguity by reading newObj.ManagedFields:
+// `f:spec.f:replicas` is owned by the *last* fieldManager that wrote
+// it, and ownership can only transfer when a client declares the
+// field in its patch. If ownership is still held by the operator's
+// own fieldManagers (FieldOwner / FieldOwnerWatcher) the inbound
+// request did not declare replicas — the 0→>0 we're seeing is
+// defaulting, not intent, and the request is admitted. If ownership
+// has moved to any other manager (kubectl-*, argocd-controller, a
+// human's CLI) we honour the original ban.
+//
 // ControllerUsername names the operator's own kube-apiserver username.
 // The S9 restore chain — which intentionally writes 0→>=1 to revive the
 // source workload after a CR delete — would otherwise be self-blocked by
 // the same rule it enforces. Requests whose UserInfo matches this
 // username are admitted unconditionally; every other client (humans,
-// HPAs, GitOps controllers) still hits the 0→>0 ban.
+// HPAs, GitOps controllers) still goes through the managed-fields gate.
 //
 // The validator is otherwise stateless: every decision is computed from
 // the inbound Deployment plus the AdmissionRequest in ctx. No apiserver
@@ -123,11 +178,16 @@ func (v *DeploymentCustomValidator) ValidateUpdate(ctx context.Context, oldObj, 
 	}
 	oldR := replicas(oldObj)
 	newR := replicas(newObj)
-	if oldR == 0 && newR > 0 {
-		return nil, fmt.Errorf("deployment %s/%s is managed by ifaas autopilot; manual scale-up from 0 is rejected — delete the KnativeAdoption to release the workload",
-			newObj.Namespace, newObj.Name)
+	if !(oldR == 0 && newR > 0) {
+		return nil, nil
 	}
-	return nil, nil
+	// 0→>0 is necessary but not sufficient. Only count it as manual
+	// scale-up when an external manager actually owns the field.
+	if !replicasOwnedByExternalManager(newObj) {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("deployment %s/%s is managed by ifaas autopilot; manual scale-up from 0 is rejected — delete the KnativeAdoption to release the workload",
+		newObj.Namespace, newObj.Name)
 }
 
 // ValidateDelete is a no-op. Cleanup of operator-owned state on delete
@@ -145,4 +205,62 @@ func replicas(d *appsv1.Deployment) int32 {
 		return 1
 	}
 	return *d.Spec.Replicas
+}
+
+// replicasOwnedByExternalManager reports whether spec.replicas is held
+// by any fieldManager other than the operator's own. A `true` here
+// means the inbound request — or some earlier write the inbound
+// request did not undo — explicitly declared the field, so the
+// 0→>0 transition we observe is real intent.
+//
+// A `false` here covers two harmless cases:
+//
+//   - the operator is the only owner (the steady state after adoption),
+//     so the request did not touch replicas;
+//   - nobody owns the field at all (rare, transitional), in which case
+//     we admit and let the next reconcile re-stamp ownership.
+//
+// Multiple entries can claim the same field under SSA (set semantics),
+// so a single external owner is enough to fail the check. We do not
+// look at entry timestamps: ownership transfer is the apiserver's job,
+// and by the time admission runs newObj.ManagedFields already reflects
+// the post-patch ownership state.
+func replicasOwnedByExternalManager(d *appsv1.Deployment) bool {
+	for _, e := range d.ManagedFields {
+		if e.FieldsV1 == nil || len(e.FieldsV1.Raw) == 0 {
+			continue
+		}
+		if !entryOwnsSpecReplicas(e.FieldsV1.Raw) {
+			continue
+		}
+		switch e.Manager {
+		case fieldOwnerAutopilot, fieldOwnerWatcher:
+			continue
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// entryOwnsSpecReplicas decodes the FieldsV1 tree of a single
+// ManagedFieldsEntry and reports whether it claims `spec.replicas`.
+// The encoding is the K8s "set" notation: every owned scalar shows up
+// as `"f:<name>": {}` under nested `"f:<parent>"` maps. We only need
+// to walk two levels: f:spec → f:replicas.
+func entryOwnsSpecReplicas(raw []byte) bool {
+	var tree map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &tree); err != nil {
+		return false
+	}
+	specRaw, ok := tree["f:spec"]
+	if !ok {
+		return false
+	}
+	var spec map[string]json.RawMessage
+	if err := json.Unmarshal(specRaw, &spec); err != nil {
+		return false
+	}
+	_, ok = spec["f:replicas"]
+	return ok
 }
