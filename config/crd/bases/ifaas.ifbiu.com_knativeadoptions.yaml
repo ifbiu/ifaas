@@ -177,6 +177,59 @@ spec:
                 required:
                 - name
                 type: object
+              traffic:
+                description: Traffic configures optional Istio traffic adaptation.
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled toggles traffic adaptation.
+                    type: boolean
+                  istio:
+                    description: Istio lists concrete traffic objects to adapt.
+                    properties:
+                      destinationRuleRefs:
+                        description: DestinationRuleRefs points at DestinationRule
+                          objects to reconcile.
+                        items:
+                          description: NamespacedObjectRef references an object in
+                            the same namespace as the CR.
+                          properties:
+                            name:
+                              description: Name is the object name.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                      virtualServiceRefs:
+                        description: VirtualServiceRefs points at VirtualService objects
+                          to reconcile.
+                        items:
+                          description: NamespacedObjectRef references an object in
+                            the same namespace as the CR.
+                          properties:
+                            name:
+                              description: Name is the object name.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                    type: object
+                  mode:
+                    default: inplace
+                    description: Mode selects how declared traffic objects are reconciled.
+                    enum:
+                    - inplace
+                    type: string
+                  servicePort:
+                    description: ServicePort is the service port traffic adaptation
+                      targets.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                type: object
             required:
             - sourceRef
             type: object
@@ -187,7 +240,7 @@ spec:
                 description: |-
                   conditions represent the current state of the KnativeAdoption resource.
                   Standard condition types: Adopted, SourceQuiesced, ServiceAdopted,
-                  ScaleDownAllowed, EventingReady, Ready, Degraded.
+                  ScaleDownAllowed, EventingReady, TrafficReady, TrafficDegraded, Ready, Degraded.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -643,6 +696,71 @@ spec:
                           More info: https://kubernetes.io/docs/concepts/services-networking/service/#publishing-services-service-types
                         type: string
                     type: object
+                  traffic:
+                    description: Traffic captures pre-adoption VS/DR specs for restore.
+                    properties:
+                      destinationRules:
+                        description: DestinationRules stores pre-adoption DestinationRule
+                          specs.
+                        items:
+                          description: TrafficObjectSnapshot captures one traffic
+                            object's pre-adoption spec.
+                          properties:
+                            name:
+                              description: Name is the traffic object name.
+                              type: string
+                            spec:
+                              description: Spec is the object's original spec payload
+                                before ifaas mutates it.
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                          type: object
+                        type: array
+                      virtualServices:
+                        description: VirtualServices stores pre-adoption VirtualService
+                          specs.
+                        items:
+                          description: TrafficObjectSnapshot captures one traffic
+                            object's pre-adoption spec.
+                          properties:
+                            name:
+                              description: Name is the traffic object name.
+                              type: string
+                            spec:
+                              description: Spec is the object's original spec payload
+                                before ifaas mutates it.
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                          type: object
+                        type: array
+                    type: object
+                type: object
+              traffic:
+                description: Traffic captures observed status of traffic adaptation.
+                properties:
+                  observedRoutes:
+                    description: ObservedRoutes lists per-object reconciliation outcomes.
+                    items:
+                      description: ObservedRoute reports the latest reconcile state
+                        for one traffic object.
+                      properties:
+                        message:
+                          description: Message carries the latest reconcile detail
+                            for this route object.
+                          type: string
+                        name:
+                          description: Name is the traffic object name.
+                          type: string
+                        ready:
+                          description: Ready indicates whether this route object is
+                            reconciled as expected.
+                          type: boolean
+                        type:
+                          description: Type identifies the traffic object type (e.g.
+                            VirtualService, DestinationRule).
+                          type: string
+                      type: object
+                    type: array
                 type: object
               url:
                 description: URL is the public address exposed by the generated Knative

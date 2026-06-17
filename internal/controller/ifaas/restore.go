@@ -18,7 +18,7 @@ package ifaas
 
 // S9 — Restore chain for KnativeAdoption.
 //
-// On adoption (handled in §S5 + §S3) the operator captures two pieces of
+// On adoption (handled in §S5 + §S3) the operator captures three pieces of
 // pre-adoption state that the user expects to get back when they release the
 // workload:
 //
@@ -27,14 +27,18 @@ package ifaas
 //   2. status.sourceSnapshot.service  — a deep copy of the same-name core
 //      Service that the swapper deleted to make room for the KSvc-derived
 //      Service.
+//   3. status.sourceSnapshot.traffic  — declared VirtualService/DestinationRule
+//      specs captured before in-place traffic adaptation.
 //
 // Two finalizers — restore-source-service and restore-source — keep the CR
 // alive past its deletionTimestamp so this file's handleDeletion routine can
 // rebuild both sides of the snapshot in the correct order:
 //
-//   - Service first, because its name collides with KSvc-derived resources and
+//   - Traffic objects first, so release exits KSvc routing semantics before
+//     the source Service and source Deployment are brought back.
+//   - Service second, because its name collides with KSvc-derived resources and
 //     therefore has to wait for the KSvc cascade to finish.
-//   - Deployment second, because scaling the source back up while the KSvc is
+//   - Deployment last, because scaling the source back up while the KSvc is
 //     still serving traffic would re-introduce the very dual-writer problem
 //     the operator was built to prevent.
 //
@@ -55,13 +59,18 @@ package ifaas
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -138,6 +147,14 @@ func (r *KnativeAdoptionReconciler) handleDeletion(ctx context.Context, a *ifaas
 		if !derivedGone {
 			setReady(a, metav1.ConditionFalse, ReasonAwaitingChildrenGC, "waiting for KSvc-derived Service cascade")
 			return ctrl.Result{RequeueAfter: requeueAfterChildGC}, nil
+		}
+
+		setReady(a, metav1.ConditionFalse, ReasonRestoringService, "rebuilding pre-adoption traffic objects")
+		if err := r.restoreTrafficSnapshots(ctx, a); err != nil {
+			setCondition(a, ifaasv1alpha1.ConditionDegraded, metav1.ConditionTrue, ReasonRestoreFailed, err.Error())
+			r.emitDual(ctx, a, eventTypeWarning, EventReasonRestoreFailed,
+				fmt.Sprintf("rebuild source traffic: %v", err))
+			return ctrl.Result{}, err
 		}
 
 		setReady(a, metav1.ConditionFalse, ReasonRestoringService, "rebuilding pre-adoption Service")
@@ -223,6 +240,113 @@ func (r *KnativeAdoptionReconciler) isDerivedServiceGone(ctx context.Context, a 
 		return false, nil
 	}
 	return true, nil
+}
+
+func (r *KnativeAdoptionReconciler) restoreTrafficSnapshots(ctx context.Context, a *ifaasv1alpha1.KnativeAdoption) error {
+	if a.Status.SourceSnapshot == nil || a.Status.SourceSnapshot.Traffic == nil {
+		return nil
+	}
+	traffic := a.Status.SourceSnapshot.Traffic
+	if err := r.restoreTrafficSnapshotList(ctx, a.Namespace, virtualServiceGVK, "VirtualService", traffic.VirtualServices); err != nil {
+		return err
+	}
+	if err := r.restoreTrafficSnapshotList(ctx, a.Namespace, destinationRuleGVK, "DestinationRule", traffic.DestinationRules); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *KnativeAdoptionReconciler) restoreTrafficSnapshotList(
+	ctx context.Context,
+	namespace string,
+	gvk schema.GroupVersionKind,
+	kind string,
+	items []ifaasv1alpha1.TrafficObjectSnapshot,
+) error {
+	for i := range items {
+		if err := r.restoreTrafficObjectSnapshot(ctx, namespace, gvk, kind, items[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *KnativeAdoptionReconciler) restoreTrafficObjectSnapshot(
+	ctx context.Context,
+	namespace string,
+	gvk schema.GroupVersionKind,
+	kind string,
+	item ifaasv1alpha1.TrafficObjectSnapshot,
+) error {
+	if item.Name == "" {
+		return nil
+	}
+
+	snapSpec, err := decodeTrafficSpecSnapshot(item.Spec)
+	if err != nil {
+		return fmt.Errorf("decode %s %s/%s snapshot: %w", kind, namespace, item.Name, err)
+	}
+
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(gvk)
+	key := types.NamespacedName{Namespace: namespace, Name: item.Name}
+	err = r.Get(ctx, key, obj)
+	if apierrors.IsNotFound(err) {
+		createObj := &unstructured.Unstructured{}
+		createObj.SetGroupVersionKind(gvk)
+		createObj.SetNamespace(namespace)
+		createObj.SetName(item.Name)
+		if snapSpec != nil {
+			if err := unstructured.SetNestedField(createObj.Object, runtime.DeepCopyJSONValue(snapSpec), "spec"); err != nil {
+				return fmt.Errorf("set %s %s/%s snapshot spec: %w", kind, namespace, item.Name, err)
+			}
+		}
+		if err := r.Create(ctx, createObj); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				return nil
+			}
+			return fmt.Errorf("create %s %s/%s from snapshot: %w", kind, namespace, item.Name, err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get %s %s/%s: %w", kind, namespace, item.Name, err)
+	}
+
+	liveSpec, found, err := unstructured.NestedFieldNoCopy(obj.Object, "spec")
+	if err != nil {
+		return fmt.Errorf("read %s %s/%s spec: %w", kind, namespace, item.Name, err)
+	}
+	if !found {
+		liveSpec = nil
+	}
+	if reflect.DeepEqual(liveSpec, snapSpec) {
+		return nil
+	}
+
+	before := obj.DeepCopy()
+	if snapSpec == nil {
+		unstructured.RemoveNestedField(obj.Object, "spec")
+	} else {
+		if err := unstructured.SetNestedField(obj.Object, runtime.DeepCopyJSONValue(snapSpec), "spec"); err != nil {
+			return fmt.Errorf("set %s %s/%s spec from snapshot: %w", kind, namespace, item.Name, err)
+		}
+	}
+	if err := r.Patch(ctx, obj, client.MergeFrom(before)); err != nil {
+		return fmt.Errorf("patch %s %s/%s from snapshot: %w", kind, namespace, item.Name, err)
+	}
+	return nil
+}
+
+func decodeTrafficSpecSnapshot(spec runtime.RawExtension) (interface{}, error) {
+	if len(spec.Raw) == 0 {
+		return nil, nil
+	}
+	decoded := map[string]interface{}{}
+	if err := json.Unmarshal(spec.Raw, &decoded); err != nil {
+		return nil, err
+	}
+	return decoded, nil
 }
 
 // rebuildSnapshotService recreates the pre-adoption Service from the spec

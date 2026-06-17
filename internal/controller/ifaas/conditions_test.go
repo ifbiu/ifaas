@@ -36,10 +36,11 @@ func cond(t string, s metav1.ConditionStatus, reason string) metav1.Condition {
 func TestRecomputeReady(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name       string
-		conds      []metav1.Condition
-		wantStatus metav1.ConditionStatus
-		wantReason string
+		name           string
+		trafficEnabled bool
+		conds          []metav1.Condition
+		wantStatus     metav1.ConditionStatus
+		wantReason     string
 	}{
 		{
 			name: "all positives true → Ready=True",
@@ -61,6 +62,18 @@ func TestRecomputeReady(t *testing.T) {
 			},
 			wantStatus: metav1.ConditionFalse,
 			wantReason: ReasonServiceApplyFailed,
+		},
+		{
+			name:           "TrafficDegraded=True overrides positives",
+			trafficEnabled: true,
+			conds: []metav1.Condition{
+				cond(ifaasv1alpha1.ConditionAdopted, metav1.ConditionTrue, ReasonAdopted),
+				cond(ifaasv1alpha1.ConditionServiceAdopted, metav1.ConditionTrue, ReasonKnativeServiceReady),
+				cond(ifaasv1alpha1.ConditionSourceQuiesced, metav1.ConditionTrue, ReasonSourceQuiesced),
+				cond(ifaasv1alpha1.ConditionTrafficDegraded, metav1.ConditionTrue, ReasonTrafficReconcileFailed),
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: ReasonTrafficReconcileFailed,
 		},
 		{
 			name: "TranslationDegraded=True wins over missing positives",
@@ -106,6 +119,29 @@ func TestRecomputeReady(t *testing.T) {
 			wantReason: ReasonKnativeServiceNotReady,
 		},
 		{
+			name:           "traffic enabled waits TrafficReady",
+			trafficEnabled: true,
+			conds: []metav1.Condition{
+				cond(ifaasv1alpha1.ConditionAdopted, metav1.ConditionTrue, ReasonAdopted),
+				cond(ifaasv1alpha1.ConditionServiceAdopted, metav1.ConditionTrue, ReasonKnativeServiceReady),
+				cond(ifaasv1alpha1.ConditionSourceQuiesced, metav1.ConditionTrue, ReasonSourceQuiesced),
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: ReasonReconciling,
+		},
+		{
+			name:           "traffic enabled with TrafficReady=True becomes Ready",
+			trafficEnabled: true,
+			conds: []metav1.Condition{
+				cond(ifaasv1alpha1.ConditionAdopted, metav1.ConditionTrue, ReasonAdopted),
+				cond(ifaasv1alpha1.ConditionServiceAdopted, metav1.ConditionTrue, ReasonKnativeServiceReady),
+				cond(ifaasv1alpha1.ConditionSourceQuiesced, metav1.ConditionTrue, ReasonSourceQuiesced),
+				cond(ifaasv1alpha1.ConditionTrafficReady, metav1.ConditionTrue, ReasonTrafficReady),
+			},
+			wantStatus: metav1.ConditionTrue,
+			wantReason: ReasonAdopted,
+		},
+		{
 			name: "ScaleDownAllowed=False does not affect Ready",
 			conds: []metav1.Condition{
 				cond(ifaasv1alpha1.ConditionAdopted, metav1.ConditionTrue, ReasonAdopted),
@@ -120,6 +156,9 @@ func TestRecomputeReady(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			a := &ifaasv1alpha1.KnativeAdoption{}
+			if tc.trafficEnabled {
+				a.Spec.Traffic = &ifaasv1alpha1.Traffic{Enabled: true}
+			}
 			a.Status.Conditions = append([]metav1.Condition{}, tc.conds...)
 			recomputeReady(a)
 			ready := apimeta.FindStatusCondition(a.Status.Conditions, ifaasv1alpha1.ConditionReady)

@@ -37,6 +37,8 @@ const (
 	ReasonSourceQuiesced         = "SourceQuiesced"
 	ReasonSourceScaleFailed      = "SourceScaleFailed"
 	ReasonReconciling            = "Reconciling"
+	ReasonTrafficReady           = "TrafficReady"
+	ReasonTrafficReconcileFailed = "TrafficReconcileFailed"
 
 	// ServiceSwapper reasons.
 	ReasonServiceSwapping       = "ServiceSwapping"
@@ -90,6 +92,7 @@ const (
 // order is the priority order: the first match wins.
 var readyAggregateFailures = []string{
 	ifaasv1alpha1.ConditionDegraded,
+	ifaasv1alpha1.ConditionTrafficDegraded,
 	ifaasv1alpha1.ConditionTranslationDegraded,
 	ifaasv1alpha1.ConditionServiceAdoptionRefuse,
 	ifaasv1alpha1.ConditionSourceMissing,
@@ -131,7 +134,13 @@ func recomputeReady(a *ifaasv1alpha1.KnativeAdoption) {
 			return
 		}
 	}
-	for _, t := range readyAggregatePositives {
+	requiredPositives := make([]string, 0, len(readyAggregatePositives)+1)
+	requiredPositives = append(requiredPositives, readyAggregatePositives...)
+	if trafficEnabled(a) {
+		requiredPositives = append(requiredPositives, ifaasv1alpha1.ConditionTrafficReady)
+	}
+
+	for _, t := range requiredPositives {
 		c := apimeta.FindStatusCondition(a.Status.Conditions, t)
 		if c == nil || c.Status != metav1.ConditionTrue {
 			reason := ReasonReconciling

@@ -18,6 +18,7 @@ package ifaas
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -183,6 +184,58 @@ var _ = Describe("KnativeAdoptionReconciler", func() {
 			dep := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ictx, types.NamespacedName{Namespace: ns, Name: name}, dep)).To(Succeed())
 			Expect(*dep.Spec.Replicas).To(Equal(int32(1)))
+		})
+
+		It("keeps progressing when traffic reconcile succeeds", func() {
+			called := false
+			rec.TrafficReconcile = func(_ context.Context, _ *ifaasv1alpha1.KnativeAdoption) error {
+				called = true
+				return nil
+			}
+
+			Expect(k8sClient.Create(ictx, makeDeployment(name, ns, 2))).To(Succeed())
+			adoption := makeAdoption(name, ns)
+			adoption.Spec.Traffic = &ifaasv1alpha1.Traffic{Enabled: true, Mode: ifaasv1alpha1.TrafficModeInplace}
+			Expect(k8sClient.Create(ictx, adoption)).To(Succeed())
+
+			_, err := rec.Reconcile(ictx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(called).To(BeTrue())
+
+			got := &ifaasv1alpha1.KnativeAdoption{}
+			Expect(k8sClient.Get(ictx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())
+			Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, ifaasv1alpha1.ConditionTrafficReady)).To(BeTrue())
+			Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, ifaasv1alpha1.ConditionTrafficDegraded)).To(BeFalse())
+			Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, ifaasv1alpha1.ConditionReady)).To(BeTrue())
+		})
+
+		It("fails fast with Ready=False when traffic reconcile errors", func() {
+			rec.TrafficReconcile = func(_ context.Context, _ *ifaasv1alpha1.KnativeAdoption) error {
+				return errors.New("traffic reconcile boom")
+			}
+
+			Expect(k8sClient.Create(ictx, makeDeployment(name, ns, 2))).To(Succeed())
+			adoption := makeAdoption(name, ns)
+			adoption.Spec.Traffic = &ifaasv1alpha1.Traffic{Enabled: true, Mode: ifaasv1alpha1.TrafficModeInplace}
+			Expect(k8sClient.Create(ictx, adoption)).To(Succeed())
+
+			_, err := rec.Reconcile(ictx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("traffic reconcile boom"))
+
+			got := &ifaasv1alpha1.KnativeAdoption{}
+			Expect(k8sClient.Get(ictx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())
+			trafficReady := apimeta.FindStatusCondition(got.Status.Conditions, ifaasv1alpha1.ConditionTrafficReady)
+			Expect(trafficReady).NotTo(BeNil())
+			Expect(trafficReady.Status).To(Equal(metav1.ConditionFalse))
+			Expect(trafficReady.Reason).To(Equal(ReasonTrafficReconcileFailed))
+			Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, ifaasv1alpha1.ConditionTrafficDegraded)).To(BeTrue())
+			Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, ifaasv1alpha1.ConditionReady)).To(BeFalse())
+
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ictx, types.NamespacedName{Namespace: ns, Name: name}, dep)).To(Succeed())
+			Expect(dep.Spec.Replicas).NotTo(BeNil())
+			Expect(*dep.Spec.Replicas).To(Equal(int32(2)))
 		})
 
 		It("cascades the KSvc when the adoption is deleted", func() {

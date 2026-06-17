@@ -88,6 +88,19 @@ rules:
   - patch
   - update
 - apiGroups:
+  - networking.istio.io
+  resources:
+  - destinationrules
+  - virtualservices
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - serving.knative.dev
   resources:
   - services

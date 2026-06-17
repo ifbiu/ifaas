@@ -17,6 +17,7 @@ limitations under the License.
 package ifaas
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -85,6 +86,10 @@ type KnativeAdoptionReconciler struct {
 	// same desired value, so the two paths are observably equivalent.
 	Flusher FlusherEnqueuer
 
+	// TrafficReconcile overrides traffic adapter behaviour in tests.
+	// Production keeps it nil and uses reconcileTraffic's default no-op path.
+	TrafficReconcile func(context.Context, *ifaasv1alpha1.KnativeAdoption) error
+
 	// Recorder emits Kubernetes Events on every observable transition
 	// (adoption complete, refusal, guard verdict, restore failure, …).
 	// Leave nil to disable event emission entirely; the helpers in
@@ -106,6 +111,8 @@ type FlusherEnqueuer interface {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;patch;update
 // +kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=get;patch;update
 // +kubebuilder:rbac:groups=serving.knative.dev,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.istio.io,resources=virtualservices,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.istio.io,resources=destinationrules,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;delete;create
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/proxy,verbs=get
@@ -237,6 +244,21 @@ func (r *KnativeAdoptionReconciler) reconcileAdoption(ctx context.Context, adopt
 		// removal before we try to apply the KSvc against the same name.
 		// A short requeue is enough — the cache will catch up almost immediately.
 		return ctrl.Result{RequeueAfter: requeueAfterServiceSwap}, nil
+	}
+
+	// Step 2.6 (M1-05): reconcile optional traffic adaptation after Service swap.
+	if trafficEnabled(adoption) {
+		if err := r.trafficReconcile()(ctx, adoption); err != nil {
+			setCondition(adoption, ifaasv1alpha1.ConditionTrafficReady, metav1.ConditionFalse, ReasonTrafficReconcileFailed, err.Error())
+			setCondition(adoption, ifaasv1alpha1.ConditionTrafficDegraded, metav1.ConditionTrue, ReasonTrafficReconcileFailed, err.Error())
+			setReady(adoption, metav1.ConditionFalse, ReasonTrafficReconcileFailed, err.Error())
+			return ctrl.Result{}, err
+		}
+		setCondition(adoption, ifaasv1alpha1.ConditionTrafficReady, metav1.ConditionTrue, ReasonTrafficReady, "traffic adaptation reconciled")
+		clearConditionIfReason(adoption, ifaasv1alpha1.ConditionTrafficDegraded, ReasonTrafficReconcileFailed)
+	} else {
+		removeCondition(adoption, ifaasv1alpha1.ConditionTrafficReady)
+		removeCondition(adoption, ifaasv1alpha1.ConditionTrafficDegraded)
 	}
 
 	// Step 3: own + server-side apply KSvc.
@@ -376,18 +398,8 @@ func statusEqual(a, b *ifaasv1alpha1.KnativeAdoption) bool {
 	if a.Status.URL != b.Status.URL {
 		return false
 	}
-	if (a.Status.SourceSnapshot == nil) != (b.Status.SourceSnapshot == nil) {
+	if !sourceSnapshotEqual(a.Status.SourceSnapshot, b.Status.SourceSnapshot) {
 		return false
-	}
-	if a.Status.SourceSnapshot != nil && b.Status.SourceSnapshot != nil {
-		ar := a.Status.SourceSnapshot.Replicas
-		br := b.Status.SourceSnapshot.Replicas
-		if (ar == nil) != (br == nil) || (ar != nil && *ar != *br) {
-			return false
-		}
-		if (a.Status.SourceSnapshot.Service == nil) != (b.Status.SourceSnapshot.Service == nil) {
-			return false
-		}
 	}
 	// LastScaleDownProbe.Time alone is intentionally excluded: it ticks on
 	// every guard round, and patching status purely to bump the timestamp
@@ -397,12 +409,68 @@ func statusEqual(a, b *ifaasv1alpha1.KnativeAdoption) bool {
 	if !probeStatusEqual(a.Status.LastScaleDownProbe, b.Status.LastScaleDownProbe) {
 		return false
 	}
+	if !trafficStatusEqual(a.Status.Traffic, b.Status.Traffic) {
+		return false
+	}
 	if len(a.Status.Conditions) != len(b.Status.Conditions) {
 		return false
 	}
 	for i := range a.Status.Conditions {
 		x, y := a.Status.Conditions[i], b.Status.Conditions[i]
 		if x.Type != y.Type || x.Status != y.Status || x.Reason != y.Reason || x.Message != y.Message {
+			return false
+		}
+	}
+	return true
+}
+
+func sourceSnapshotEqual(a, b *ifaasv1alpha1.SourceSnapshot) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	if (a.Replicas == nil) != (b.Replicas == nil) {
+		return false
+	}
+	if a.Replicas != nil && b.Replicas != nil && *a.Replicas != *b.Replicas {
+		return false
+	}
+	if (a.Service == nil) != (b.Service == nil) {
+		return false
+	}
+	if !trafficSnapshotEqual(a.Traffic, b.Traffic) {
+		return false
+	}
+	return true
+}
+
+func trafficSnapshotEqual(a, b *ifaasv1alpha1.TrafficSnapshot) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	if !trafficObjectSnapshotsEqual(a.VirtualServices, b.VirtualServices) {
+		return false
+	}
+	if !trafficObjectSnapshotsEqual(a.DestinationRules, b.DestinationRules) {
+		return false
+	}
+	return true
+}
+
+func trafficObjectSnapshotsEqual(a, b []ifaasv1alpha1.TrafficObjectSnapshot) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name {
+			return false
+		}
+		if !bytes.Equal(a[i].Spec.Raw, b[i].Spec.Raw) {
 			return false
 		}
 	}
@@ -419,6 +487,31 @@ func probeStatusEqual(a, b *ifaasv1alpha1.ProbeStatus) bool {
 	return a.Result == b.Result &&
 		a.Message == b.Message &&
 		a.ConsecutiveErrors == b.ConsecutiveErrors
+}
+
+func trafficStatusEqual(a, b *ifaasv1alpha1.TrafficStatus) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	if len(a.ObservedRoutes) != len(b.ObservedRoutes) {
+		return false
+	}
+	for i := range a.ObservedRoutes {
+		x, y := a.ObservedRoutes[i], b.ObservedRoutes[i]
+		if x.Type != y.Type || x.Name != y.Name || x.Message != y.Message {
+			return false
+		}
+		if (x.Ready == nil) != (y.Ready == nil) {
+			return false
+		}
+		if x.Ready != nil && y.Ready != nil && *x.Ready != *y.Ready {
+			return false
+		}
+	}
+	return true
 }
 
 func setCondition(a *ifaasv1alpha1.KnativeAdoption, t string, s metav1.ConditionStatus, reason, msg string) {
@@ -468,6 +561,13 @@ func (r *KnativeAdoptionReconciler) serviceReady() func(*kservingv1.Service) (bo
 		return r.ServiceReady
 	}
 	return knativeServiceReady
+}
+
+func (r *KnativeAdoptionReconciler) trafficReconcile() func(context.Context, *ifaasv1alpha1.KnativeAdoption) error {
+	if r.TrafficReconcile != nil {
+		return r.TrafficReconcile
+	}
+	return r.reconcileTraffic
 }
 
 // SetupWithManager sets up the controller with the Manager.

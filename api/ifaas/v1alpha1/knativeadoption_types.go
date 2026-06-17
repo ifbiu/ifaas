@@ -68,6 +68,8 @@ const (
 	ConditionServiceAdopted        = "ServiceAdopted"
 	ConditionScaleDownAllowed      = "ScaleDownAllowed"
 	ConditionEventingReady         = "EventingReady"
+	ConditionTrafficReady          = "TrafficReady"
+	ConditionTrafficDegraded       = "TrafficDegraded"
 	ConditionReady                 = "Ready"
 	ConditionDegraded              = "Degraded"
 	ConditionSourceMissing         = "SourceMissing"
@@ -168,6 +170,57 @@ type EventingFilter struct {
 	Source string `json:"source,omitempty"`
 }
 
+// TrafficMode controls how the operator reconciles externally managed traffic objects.
+//
+// +kubebuilder:validation:Enum=inplace
+type TrafficMode string
+
+const (
+	// TrafficModeInplace mutates declared traffic objects in place.
+	TrafficModeInplace TrafficMode = "inplace"
+)
+
+// NamespacedObjectRef references an object in the same namespace as the CR.
+type NamespacedObjectRef struct {
+	// Name is the object name.
+	// +required
+	Name string `json:"name"`
+}
+
+// IstioTraffic lists the Istio objects that traffic adaptation may reconcile.
+type IstioTraffic struct {
+	// VirtualServiceRefs points at VirtualService objects to reconcile.
+	// +optional
+	VirtualServiceRefs []NamespacedObjectRef `json:"virtualServiceRefs,omitempty"`
+
+	// DestinationRuleRefs points at DestinationRule objects to reconcile.
+	// +optional
+	DestinationRuleRefs []NamespacedObjectRef `json:"destinationRuleRefs,omitempty"`
+}
+
+// Traffic configures optional Istio traffic adaptation for this adoption.
+type Traffic struct {
+	// Enabled toggles traffic adaptation.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Mode selects how declared traffic objects are reconciled.
+	// +kubebuilder:default=inplace
+	// +optional
+	Mode TrafficMode `json:"mode,omitempty"`
+
+	// Istio lists concrete traffic objects to adapt.
+	// +optional
+	Istio *IstioTraffic `json:"istio,omitempty"`
+
+	// ServicePort is the service port traffic adaptation targets.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +optional
+	ServicePort *int32 `json:"servicePort,omitempty"`
+}
+
 // KnativeAdoptionSpec defines the desired state of KnativeAdoption.
 type KnativeAdoptionSpec struct {
 	// SourceRef points at the Deployment to adopt.
@@ -195,6 +248,32 @@ type KnativeAdoptionSpec struct {
 	// Eventing is only honoured when mode=eventing.
 	// +optional
 	Eventing *Eventing `json:"eventing,omitempty"`
+
+	// Traffic configures optional Istio traffic adaptation.
+	// +optional
+	Traffic *Traffic `json:"traffic,omitempty"`
+}
+
+// TrafficObjectSnapshot captures one traffic object's pre-adoption spec.
+type TrafficObjectSnapshot struct {
+	// Name is the traffic object name.
+	// +optional
+	Name string `json:"name,omitempty"`
+
+	// Spec is the object's original spec payload before ifaas mutates it.
+	// +optional
+	Spec runtime.RawExtension `json:"spec,omitempty"`
+}
+
+// TrafficSnapshot captures pre-adoption traffic objects for restore.
+type TrafficSnapshot struct {
+	// VirtualServices stores pre-adoption VirtualService specs.
+	// +optional
+	VirtualServices []TrafficObjectSnapshot `json:"virtualServices,omitempty"`
+
+	// DestinationRules stores pre-adoption DestinationRule specs.
+	// +optional
+	DestinationRules []TrafficObjectSnapshot `json:"destinationRules,omitempty"`
 }
 
 // SourceSnapshot captures pre-adoption state used during teardown.
@@ -207,6 +286,10 @@ type SourceSnapshot struct {
 	// Used by the ServiceSwapper finalizer to rebuild the original Service on release.
 	// +optional
 	Service *corev1.ServiceSpec `json:"service,omitempty"`
+
+	// Traffic captures pre-adoption VS/DR specs for restore.
+	// +optional
+	Traffic *TrafficSnapshot `json:"traffic,omitempty"`
 }
 
 // ProbeStatus records the most recent /scaledownz guard result.
@@ -229,11 +312,37 @@ type ProbeStatus struct {
 	ConsecutiveErrors int32 `json:"consecutiveErrors,omitempty"`
 }
 
+// ObservedRoute reports the latest reconcile state for one traffic object.
+type ObservedRoute struct {
+	// Type identifies the traffic object type (e.g. VirtualService, DestinationRule).
+	// +optional
+	Type string `json:"type,omitempty"`
+
+	// Name is the traffic object name.
+	// +optional
+	Name string `json:"name,omitempty"`
+
+	// Ready indicates whether this route object is reconciled as expected.
+	// +optional
+	Ready *bool `json:"ready,omitempty"`
+
+	// Message carries the latest reconcile detail for this route object.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
+// TrafficStatus captures observed status of traffic adaptation.
+type TrafficStatus struct {
+	// ObservedRoutes lists per-object reconciliation outcomes.
+	// +optional
+	ObservedRoutes []ObservedRoute `json:"observedRoutes,omitempty"`
+}
+
 // KnativeAdoptionStatus defines the observed state of KnativeAdoption.
 type KnativeAdoptionStatus struct {
 	// conditions represent the current state of the KnativeAdoption resource.
 	// Standard condition types: Adopted, SourceQuiesced, ServiceAdopted,
-	// ScaleDownAllowed, EventingReady, Ready, Degraded.
+	// ScaleDownAllowed, EventingReady, TrafficReady, TrafficDegraded, Ready, Degraded.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
@@ -250,6 +359,10 @@ type KnativeAdoptionStatus struct {
 	// LastScaleDownProbe is the most recent /scaledownz guard outcome.
 	// +optional
 	LastScaleDownProbe *ProbeStatus `json:"lastScaleDownProbe,omitempty"`
+
+	// Traffic captures observed status of traffic adaptation.
+	// +optional
+	Traffic *TrafficStatus `json:"traffic,omitempty"`
 
 	// ObservedSourceHash is the hash of Deployment.spec last reconciled into the KSvc.
 	// +optional

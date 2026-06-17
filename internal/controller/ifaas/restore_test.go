@@ -18,6 +18,8 @@ package ifaas
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -27,8 +29,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -217,6 +224,122 @@ var _ = Describe("KnativeAdoption Restore (S9)", func() {
 		})
 	})
 
+	Context("traffic snapshot restore in deletion phase", func() {
+		It("restores VS/DR objects to the snapshotted spec payload", func() {
+			const name = "restore-traffic-fake"
+			vsSpec := map[string]interface{}{
+				"hosts": []interface{}{"restore.example.com"},
+				"gateways": []interface{}{"netops/common-inbound-gateway"},
+				"http": []interface{}{
+					map[string]interface{}{
+						"route": []interface{}{
+							map[string]interface{}{
+								"destination": map[string]interface{}{
+									"host": "gops-ckbackup.default.svc.cluster.local",
+									"port": map[string]interface{}{"number": int64(5555)},
+								},
+								"weight": int64(100),
+							},
+						},
+					},
+				},
+			}
+			drSpec := map[string]interface{}{
+				"host": "gops-ckbackup.default.svc.cluster.local",
+				"subsets": []interface{}{
+					map[string]interface{}{
+						"name": "stable",
+						"labels": map[string]interface{}{"app": "gops-ckbackup"},
+					},
+				},
+			}
+
+			driftDR := makeDestinationRule(
+				"managed-dr",
+				ns,
+				"gops-ckbackup.default.svc.cluster.local",
+				[]interface{}{makeSubset("drifted")},
+			)
+
+			fakeRec := newRestoreFakeReconciler(driftDR)
+			adoption := makeAdoption(name, ns)
+			adoption.Status.SourceSnapshot = &ifaasv1alpha1.SourceSnapshot{
+				Traffic: &ifaasv1alpha1.TrafficSnapshot{
+					VirtualServices: []ifaasv1alpha1.TrafficObjectSnapshot{{
+						Name: "managed-vs",
+						Spec: mustRawExtension(vsSpec),
+					}},
+					DestinationRules: []ifaasv1alpha1.TrafficObjectSnapshot{{
+						Name: "managed-dr",
+						Spec: mustRawExtension(drSpec),
+					}},
+				},
+			}
+
+			Expect(fakeRec.restoreTrafficSnapshots(ictx, adoption)).To(Succeed())
+
+			vs := &unstructured.Unstructured{}
+			vs.SetGroupVersionKind(virtualServiceGVK)
+			Expect(fakeRec.Get(ictx, types.NamespacedName{Namespace: ns, Name: "managed-vs"}, vs)).To(Succeed())
+			vsRestoredSpec, err := rawSpecSnapshot(vs)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(vsRestoredSpec.Raw).To(MatchJSON(string(adoption.Status.SourceSnapshot.Traffic.VirtualServices[0].Spec.Raw)))
+
+			dr := &unstructured.Unstructured{}
+			dr.SetGroupVersionKind(destinationRuleGVK)
+			Expect(fakeRec.Get(ictx, types.NamespacedName{Namespace: ns, Name: "managed-dr"}, dr)).To(Succeed())
+			drRestoredSpec, err := rawSpecSnapshot(dr)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(drRestoredSpec.Raw).To(MatchJSON(string(adoption.Status.SourceSnapshot.Traffic.DestinationRules[0].Spec.Raw)))
+
+			Expect(fakeRec.restoreTrafficSnapshots(ictx, adoption)).To(Succeed())
+			vsAfterSecond := &unstructured.Unstructured{}
+			vsAfterSecond.SetGroupVersionKind(virtualServiceGVK)
+			Expect(fakeRec.Get(ictx, types.NamespacedName{Namespace: ns, Name: "managed-vs"}, vsAfterSecond)).To(Succeed())
+			vsSpecAfterSecond, err := rawSpecSnapshot(vsAfterSecond)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(vsSpecAfterSecond.Raw).To(MatchJSON(string(adoption.Status.SourceSnapshot.Traffic.VirtualServices[0].Spec.Raw)))
+		})
+
+		It("fails before service restore when traffic restore cannot proceed", func() {
+			const name = "restore-order-traffic-first"
+			svcSpec := makeServiceForRestore(name, ns).Spec
+			adoption := makeAdoption(name, ns)
+			adoption.Finalizers = []string{FinalizerRestoreSourceService}
+			adoption.Status.SourceSnapshot = &ifaasv1alpha1.SourceSnapshot{
+				Service: &svcSpec,
+				Traffic: &ifaasv1alpha1.TrafficSnapshot{
+					VirtualServices: []ifaasv1alpha1.TrafficObjectSnapshot{{
+						Name: "managed-vs",
+						Spec: mustRawExtension(map[string]interface{}{
+							"hosts": []interface{}{"restore.example.com"},
+							"http":  []interface{}{},
+						}),
+					}},
+				},
+			}
+
+			baseRec := newRestoreFakeReconciler(adoption)
+			failingRec := &KnativeAdoptionReconciler{
+				Client:       &failVirtualServiceGetClient{Client: baseRec.Client},
+				Scheme:       baseRec.Scheme,
+				ServiceReady: alwaysReady,
+			}
+			cur := &ifaasv1alpha1.KnativeAdoption{}
+			Expect(failingRec.Get(ictx, types.NamespacedName{Namespace: ns, Name: name}, cur)).To(Succeed())
+
+			_, err := failingRec.handleDeletion(ictx, cur)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("injected virtualservice get failure"))
+
+			service := &corev1.Service{}
+			err = failingRec.Get(ictx, types.NamespacedName{Namespace: ns, Name: name}, service)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "service must not be rebuilt when traffic restore fails")
+			Expect(controllerutil.ContainsFinalizer(cur, FinalizerRestoreSourceService)).To(BeTrue(),
+				"service finalizer should remain so deletion can resume after traffic restore recovers")
+		})
+	})
+
 	Context("ensureFinalizers is idempotent", func() {
 		const name = "restore-finalizers"
 
@@ -243,3 +366,62 @@ var _ = Describe("KnativeAdoption Restore (S9)", func() {
 })
 
 func ptrInt32(v int32) *int32 { return &v }
+
+func newRestoreFakeReconciler(objs ...client.Object) *KnativeAdoptionReconciler {
+	s := newRestoreFakeScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
+	return &KnativeAdoptionReconciler{Client: cl, Scheme: s, ServiceReady: alwaysReady}
+}
+
+func newRestoreFakeScheme() *runtime.Scheme {
+	s := newRestoreBaseScheme()
+	s.AddKnownTypeWithName(virtualServiceGVK, &unstructured.Unstructured{})
+	s.AddKnownTypeWithName(schema.GroupVersionKind{
+		Group:   virtualServiceGVK.Group,
+		Version: virtualServiceGVK.Version,
+		Kind:    "VirtualServiceList",
+	}, &unstructured.UnstructuredList{})
+	s.AddKnownTypeWithName(destinationRuleGVK, &unstructured.Unstructured{})
+	s.AddKnownTypeWithName(schema.GroupVersionKind{
+		Group:   destinationRuleGVK.Group,
+		Version: destinationRuleGVK.Version,
+		Kind:    "DestinationRuleList",
+	}, &unstructured.UnstructuredList{})
+	return s
+}
+
+func newRestoreBaseScheme() *runtime.Scheme {
+	s := runtime.NewScheme()
+	mustAddToScheme(s, ifaasv1alpha1.AddToScheme)
+	mustAddToScheme(s, appsv1.AddToScheme)
+	mustAddToScheme(s, corev1.AddToScheme)
+	mustAddToScheme(s, kservingv1.AddToScheme)
+	return s
+}
+
+func mustAddToScheme(s *runtime.Scheme, add func(*runtime.Scheme) error) {
+	if err := add(s); err != nil {
+		panic(err)
+	}
+}
+
+func mustRawExtension(spec map[string]interface{}) runtime.RawExtension {
+	raw, err := json.Marshal(spec)
+	if err != nil {
+		panic(err)
+	}
+	return runtime.RawExtension{Raw: raw}
+}
+
+type failVirtualServiceGetClient struct {
+	client.Client
+}
+
+func (c *failVirtualServiceGetClient) Get(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+	if u, ok := obj.(*unstructured.Unstructured); ok {
+		if u.GroupVersionKind() == virtualServiceGVK {
+			return errors.New("injected virtualservice get failure")
+		}
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
