@@ -23,6 +23,7 @@ import (
 	"reflect"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -113,6 +114,101 @@ func TestReconcileTrafficNoopWhenTrafficDisabled(t *testing.T) {
 				t.Fatalf("reconcileTraffic() mutated status: before=%+v after=%+v", before.Status, tc.adoption.Status)
 			}
 		})
+	}
+}
+
+func TestResolveTrafficTargetServicePortPrefersLiveServicePort(t *testing.T) {
+	t.Parallel()
+
+	ns := "platform-a"
+	specPort := int32(5555)
+	livePort := int32(80)
+
+	rec := newTrafficTestReconciler(t, makeServiceWithPort("gops-ckbackup", ns, livePort))
+	adoption := makeTrafficAdoption("gops-ckbackup", ns, &specPort, []string{"managed-vs"})
+
+	got, err := rec.resolveTrafficTargetServicePort(context.Background(), adoption)
+	if err != nil {
+		t.Fatalf("resolveTrafficTargetServicePort() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("resolveTrafficTargetServicePort() returned nil, want %d", livePort)
+	}
+	if *got != livePort {
+		t.Fatalf("resolveTrafficTargetServicePort() = %d, want %d", *got, livePort)
+	}
+}
+
+func TestResolveTrafficTargetServicePortFallsBackToSpecPortWhenServiceMissing(t *testing.T) {
+	t.Parallel()
+
+	ns := "platform-a"
+	specPort := int32(5555)
+
+	rec := newTrafficTestReconciler(t)
+	adoption := makeTrafficAdoption("gops-ckbackup", ns, &specPort, []string{"managed-vs"})
+
+	got, err := rec.resolveTrafficTargetServicePort(context.Background(), adoption)
+	if err != nil {
+		t.Fatalf("resolveTrafficTargetServicePort() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("resolveTrafficTargetServicePort() returned nil, want %d", specPort)
+	}
+	if *got != specPort {
+		t.Fatalf("resolveTrafficTargetServicePort() = %d, want %d", *got, specPort)
+	}
+}
+
+func TestReconcileTrafficVirtualServiceRewritesDestinationPortToLiveService(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	ns := "platform-a"
+	specPort := int32(5555)
+	livePort := int32(80)
+
+	managed := makeVirtualService(
+		"managed-vs",
+		ns,
+		[]interface{}{
+			map[string]interface{}{
+				"route": []interface{}{
+					makeRoute("gops-ckbackup.platform-a.svc.cluster.local", 5555, "stable"),
+					makeRoute("gops-ckbackup.platform-a.svc.cluster.local", 6666, "keep-mismatch"),
+					makeRoute("legacy.platform-a.svc.cluster.local", 5555, "legacy"),
+				},
+			},
+		},
+	)
+
+	rec := newTrafficTestReconciler(t, makeServiceWithPort("gops-ckbackup", ns, livePort), managed)
+	adoption := makeTrafficAdoption("gops-ckbackup", ns, &specPort, []string{"managed-vs"})
+
+	if err := rec.reconcileTraffic(ctx, adoption); err != nil {
+		t.Fatalf("reconcileTraffic() error = %v", err)
+	}
+
+	gotManaged := getVirtualService(t, rec.Client, ns, "managed-vs")
+	if hasSubset(gotManaged, 0, 0) {
+		t.Fatalf("managed VS target destination subset should be removed")
+	}
+	if port, ok := routePortNumber(gotManaged, 0, 0); !ok || port != livePort {
+		t.Fatalf("managed VS target destination port = %d (ok=%v), want %d", port, ok, livePort)
+	}
+
+	if !hasSubset(gotManaged, 0, 1) {
+		t.Fatalf("managed VS target host with non-managed port subset should stay")
+	}
+	if port, ok := routePortNumber(gotManaged, 0, 1); !ok || port != 6666 {
+		t.Fatalf("managed VS non-managed port route = %d (ok=%v), want 6666", port, ok)
+	}
+
+	if !hasSubset(gotManaged, 0, 2) {
+		t.Fatalf("managed VS non-target host subset should stay")
+	}
+	if port, ok := routePortNumber(gotManaged, 0, 2); !ok || port != 5555 {
+		t.Fatalf("managed VS non-target host route port = %d (ok=%v), want 5555", port, ok)
 	}
 }
 
@@ -554,6 +650,9 @@ func newTrafficTestScheme(t *testing.T) *runtime.Scheme {
 	if err := ifaasv1alpha1.AddToScheme(s); err != nil {
 		t.Fatalf("add ifaas scheme: %v", err)
 	}
+	if err := corev1.AddToScheme(s); err != nil {
+		t.Fatalf("add corev1 scheme: %v", err)
+	}
 	s.AddKnownTypeWithName(virtualServiceGVK, &unstructured.Unstructured{})
 	s.AddKnownTypeWithName(schema.GroupVersionKind{
 		Group:   virtualServiceGVK.Group,
@@ -667,6 +766,24 @@ func makeRoute(host string, port int64, subset string) map[string]interface{} {
 	}
 }
 
+func makeServiceWithPort(name, namespace string, port int32) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{
+					Name:     "http",
+					Port:     port,
+					Protocol: corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+}
+
 func getVirtualService(t *testing.T, cl client.Client, namespace, name string) *unstructured.Unstructured {
 	t.Helper()
 	vs := &unstructured.Unstructured{}
@@ -703,6 +820,18 @@ func hasSubset(vs *unstructured.Unstructured, httpIdx, routeIdx int) bool {
 	}
 	_, exists := destination["subset"]
 	return exists
+}
+
+func routePortNumber(vs *unstructured.Unstructured, httpIdx, routeIdx int) (int32, bool) {
+	destination, ok := routeDestination(vs, httpIdx, routeIdx)
+	if !ok {
+		return 0, false
+	}
+	portBlock, ok := destination["port"].(map[string]interface{})
+	if !ok {
+		return 0, false
+	}
+	return nestedInt32(portBlock, "number")
 }
 
 func routeDestination(vs *unstructured.Unstructured, httpIdx, routeIdx int) (map[string]interface{}, bool) {

@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -61,6 +63,11 @@ func (r *KnativeAdoptionReconciler) reconcileTraffic(ctx context.Context, adopti
 		setObservedRoutes(adoption, []ifaasv1alpha1.ObservedRoute{newObservedRoute("Traffic", "mode", false, err.Error())})
 		return err
 	}
+	targetServicePort, err := r.resolveTrafficTargetServicePort(ctx, adoption)
+	if err != nil {
+		setObservedRoutes(adoption, []ifaasv1alpha1.ObservedRoute{newObservedRoute("Traffic", "servicePort", false, err.Error())})
+		return err
+	}
 
 	observed := make([]ifaasv1alpha1.ObservedRoute, 0, len(virtualServiceRefs(adoption))+len(destinationRuleRefs(adoption)))
 	var firstErr error
@@ -74,7 +81,7 @@ func (r *KnativeAdoptionReconciler) reconcileTraffic(ctx context.Context, adopti
 			}
 			continue
 		}
-		changed, err := r.reconcileVirtualService(ctx, adoption, ref.Name)
+		changed, err := r.reconcileVirtualService(ctx, adoption, ref.Name, targetServicePort)
 		if err != nil {
 			observed = append(observed, newObservedRoute("VirtualService", ref.Name, false, err.Error()))
 			if firstErr == nil {
@@ -181,6 +188,46 @@ func destinationRuleRefs(adoption *ifaasv1alpha1.KnativeAdoption) []ifaasv1alpha
 	return adoption.Spec.Traffic.Istio.DestinationRuleRefs
 }
 
+func specTrafficServicePort(adoption *ifaasv1alpha1.KnativeAdoption) *int32 {
+	if adoption == nil || adoption.Spec.Traffic == nil || adoption.Spec.Traffic.ServicePort == nil {
+		return nil
+	}
+	v := *adoption.Spec.Traffic.ServicePort
+	return &v
+}
+
+func firstServicePort(svc *corev1.Service) *int32 {
+	if svc == nil || len(svc.Spec.Ports) == 0 {
+		return nil
+	}
+	port := svc.Spec.Ports[0].Port
+	if port <= 0 {
+		return nil
+	}
+	v := port
+	return &v
+}
+
+func (r *KnativeAdoptionReconciler) resolveTrafficTargetServicePort(ctx context.Context, adoption *ifaasv1alpha1.KnativeAdoption) (*int32, error) {
+	fallback := specTrafficServicePort(adoption)
+	if adoption == nil {
+		return fallback, nil
+	}
+
+	svc := &corev1.Service{}
+	key := types.NamespacedName{Namespace: adoption.Namespace, Name: sourceName(adoption)}
+	if err := r.Get(ctx, key, svc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fallback, nil
+		}
+		return nil, fmt.Errorf("get target Service %s/%s: %w", adoption.Namespace, sourceName(adoption), err)
+	}
+	if port := firstServicePort(svc); port != nil {
+		return port, nil
+	}
+	return fallback, nil
+}
+
 func snapshotVirtualServiceOnce(adoption *ifaasv1alpha1.KnativeAdoption, name string, vs *unstructured.Unstructured) error {
 	if adoption == nil || name == "" {
 		return nil
@@ -253,7 +300,7 @@ func rawSpecSnapshot(obj *unstructured.Unstructured) (runtime.RawExtension, erro
 	return runtime.RawExtension{Raw: raw}, nil
 }
 
-func (r *KnativeAdoptionReconciler) reconcileVirtualService(ctx context.Context, adoption *ifaasv1alpha1.KnativeAdoption, name string) (bool, error) {
+func (r *KnativeAdoptionReconciler) reconcileVirtualService(ctx context.Context, adoption *ifaasv1alpha1.KnativeAdoption, name string, targetServicePort *int32) (bool, error) {
 	vs := &unstructured.Unstructured{}
 	vs.SetGroupVersionKind(virtualServiceGVK)
 	key := types.NamespacedName{Namespace: adoption.Namespace, Name: name}
@@ -265,7 +312,13 @@ func (r *KnativeAdoptionReconciler) reconcileVirtualService(ctx context.Context,
 	}
 
 	before := vs.DeepCopy()
-	changed, err := stripSubsetFromTargetDestinations(vs, sourceName(adoption), adoption.Namespace, adoption.Spec.Traffic.ServicePort)
+	changed, err := stripSubsetFromTargetDestinations(
+		vs,
+		sourceName(adoption),
+		adoption.Namespace,
+		specTrafficServicePort(adoption),
+		targetServicePort,
+	)
 	if err != nil {
 		return false, fmt.Errorf("reconcile VirtualService %s/%s: %w", adoption.Namespace, name, err)
 	}
@@ -320,7 +373,13 @@ func stripTargetServiceSubsets(dr *unstructured.Unstructured, serviceName, names
 	return true, nil
 }
 
-func stripSubsetFromTargetDestinations(vs *unstructured.Unstructured, serviceName, namespace string, servicePort *int32) (bool, error) {
+func stripSubsetFromTargetDestinations(
+	vs *unstructured.Unstructured,
+	serviceName,
+	namespace string,
+	servicePort *int32,
+	targetServicePort *int32,
+) (bool, error) {
 	https, found, err := unstructured.NestedSlice(vs.Object, "spec", "http")
 	if err != nil {
 		return false, fmt.Errorf("read spec.http: %w", err)
@@ -329,6 +388,7 @@ func stripSubsetFromTargetDestinations(vs *unstructured.Unstructured, serviceNam
 		return false, nil
 	}
 
+	managedPorts := trafficManagedPortSet(servicePort, targetServicePort)
 	changed := false
 	for i := range https {
 		httpRoute, ok := https[i].(map[string]interface{})
@@ -350,13 +410,25 @@ func stripSubsetFromTargetDestinations(vs *unstructured.Unstructured, serviceNam
 			if !ok {
 				continue
 			}
-			if !destinationTargetsService(destination, serviceName, namespace, servicePort) {
+			if !destinationTargetsService(destination, serviceName, namespace) {
 				continue
 			}
-			if _, exists := destination["subset"]; !exists {
+			if !destinationMatchesManagedPort(destination, managedPorts) {
 				continue
 			}
-			delete(destination, "subset")
+
+			destinationChanged := false
+			if targetServicePort != nil && ensureDestinationPort(destination, *targetServicePort) {
+				destinationChanged = true
+			}
+			if _, exists := destination["subset"]; exists {
+				delete(destination, "subset")
+				destinationChanged = true
+			}
+			if !destinationChanged {
+				continue
+			}
+
 			route["destination"] = destination
 			routes[j] = route
 			routeChanged = true
@@ -378,15 +450,24 @@ func stripSubsetFromTargetDestinations(vs *unstructured.Unstructured, serviceNam
 	return true, nil
 }
 
-func destinationTargetsService(destination map[string]interface{}, serviceName, namespace string, servicePort *int32) bool {
-	host, _ := destination["host"].(string)
-	if !serviceHostMatches(host, serviceName, namespace) {
-		return false
+func trafficManagedPortSet(ports ...*int32) map[int32]struct{} {
+	set := make(map[int32]struct{})
+	for _, port := range ports {
+		if port == nil || *port <= 0 {
+			continue
+		}
+		set[*port] = struct{}{}
 	}
-	if servicePort == nil {
+	if len(set) == 0 {
+		return nil
+	}
+	return set
+}
+
+func destinationMatchesManagedPort(destination map[string]interface{}, managedPorts map[int32]struct{}) bool {
+	if len(managedPorts) == 0 {
 		return true
 	}
-
 	portBlock, ok := destination["port"].(map[string]interface{})
 	if !ok {
 		return false
@@ -395,7 +476,28 @@ func destinationTargetsService(destination map[string]interface{}, serviceName, 
 	if !found {
 		return false
 	}
-	return port == *servicePort
+	_, ok = managedPorts[port]
+	return ok
+}
+
+func ensureDestinationPort(destination map[string]interface{}, servicePort int32) bool {
+	portBlock, ok := destination["port"].(map[string]interface{})
+	if !ok || portBlock == nil {
+		destination["port"] = map[string]interface{}{"number": int64(servicePort)}
+		return true
+	}
+	port, found := nestedInt32(portBlock, "number")
+	if found && port == servicePort {
+		return false
+	}
+	portBlock["number"] = int64(servicePort)
+	destination["port"] = portBlock
+	return true
+}
+
+func destinationTargetsService(destination map[string]interface{}, serviceName, namespace string) bool {
+	host, _ := destination["host"].(string)
+	return serviceHostMatches(host, serviceName, namespace)
 }
 
 func nestedInt32(obj map[string]interface{}, fields ...string) (int32, bool) {
